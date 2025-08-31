@@ -12,6 +12,7 @@ from database.connection import db
 from services.openai_service import generate_daily_motivation
 from services.encryption_service import decrypt_text
 from aiogram import types
+from handlers.admin import send_daily_backup
 
 logger = logging.getLogger(__name__)
 
@@ -271,7 +272,8 @@ class SchedulerService:
         system_jobs = [
             ("daily_motivation", self.send_daily_motivation, CronTrigger(hour=8, minute=0)),
             ("evening_review", self.send_evening_review, CronTrigger(hour=23, minute=0)),
-            ("overdue_check", self.check_overdue_tasks, CronTrigger(hour=0, minute=30))
+            ("overdue_check", self.check_overdue_tasks, CronTrigger(hour=0, minute=30)),
+            ("daily_backup", self.send_daily_backup, CronTrigger(hour=12, minute=0)) 
         ]
 
         try:
@@ -527,6 +529,13 @@ class SchedulerService:
         # Если уже naive, возвращаем как есть
         return dt
 
+    async def send_daily_backup(self):
+        """Ежедневная отправка бэкапа админу в 12:00 UTC"""
+        try:
+            await send_daily_backup(self.bot)
+            logger.info("Daily backup task completed")
+        except Exception as e:
+            logger.error(f"Error in daily backup task: {e}")
 
 # Глобальный экземпляр
 scheduler_service = None

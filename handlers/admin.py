@@ -1,12 +1,13 @@
 import logging
 from aiogram import Router, Bot, F
-from aiogram.types import Message
+from aiogram.types import Message, BufferedInputFile
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from config import ADMIN_USER_ID
 from database.connection import db
+from services.backup_service import backup_service
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -17,6 +18,82 @@ class BroadcastStates(StatesGroup):
 def is_admin(user_id: int) -> bool:
     """Проверка, является ли пользователь админом"""
     return user_id == ADMIN_USER_ID
+
+@router.message(Command("backup"))
+async def backup_command(message: Message):
+    """Команда для создания бэкапа базы данных"""
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ У вас нет прав для выполнения этой команды.")
+        return
+    
+    try:
+        # Уведомляем о начале создания бэкапа
+        status_message = await message.answer("🔄 Создаю бэкап базы данных...")
+        
+        # Создаем сжатый бэкап
+        compressed_backup, filename, metadata = await backup_service.create_compressed_backup()
+        
+        # Форматируем сводку
+        summary = backup_service.format_backup_summary(metadata)
+        
+        # Создаем файл для отправки
+        input_file = BufferedInputFile(
+            file=compressed_backup.getvalue(),
+            filename=filename
+        )
+        
+        # Отправляем файл с описанием
+        await message.answer_document(
+            document=input_file,
+            caption=summary
+        )
+        
+        # Удаляем статусное сообщение
+        await status_message.delete()
+        
+        logger.info(f"Manual backup sent to admin {message.from_user.id}")
+        
+    except Exception as e:
+        logger.error(f"Error creating manual backup: {e}")
+        await message.answer(f"❌ Ошибка создания бэкапа: {e}")
+
+async def send_daily_backup(bot: Bot):
+    """Отправка ежедневного бэкапа админу"""
+    try:
+        logger.info("Starting daily backup creation")
+        
+        # Создаем сжатый бэкап
+        compressed_backup, filename, metadata = await backup_service.create_compressed_backup()
+        
+        # Форматируем сводку
+        summary = f"📅 Ежедневный автоматический бэкап\n\n{backup_service.format_backup_summary(metadata)}"
+        
+        # Создаем файл для отправки
+        input_file = BufferedInputFile(
+            file=compressed_backup.getvalue(),
+            filename=filename
+        )
+        
+        # Отправляем бэкап админу
+        await bot.send_document(
+            chat_id=ADMIN_USER_ID,
+            document=input_file,
+            caption=summary
+        )
+        
+        logger.info("Daily backup sent successfully")
+        
+    except Exception as e:
+        logger.error(f"Error sending daily backup: {e}")
+        
+        # Пытаемся отправить уведомление об ошибке
+        try:
+            await bot.send_message(
+                chat_id=ADMIN_USER_ID,
+                text=f"❌ Ошибка создания ежедневного бэкапа:\n\n{e}"
+            )
+        except Exception as notify_error:
+            logger.error(f"Failed to send error notification: {notify_error}")
 
 @router.message(Command("broadcast"))
 async def broadcast_command(message: Message, state: FSMContext):
@@ -106,8 +183,10 @@ async def admin_commands(message: Message):
         "🔧 <b>Команды администратора:</b>\n\n"
         "📢 <code>/broadcast [текст]</code> - Рассылка сообщения всем пользователям\n"
         "📊 <code>/stats</code> - Статистика бота\n"
+        "💾 <code>/backup</code> - Создать бэкап базы данных\n"
         "🔄 <code>/migrate</code> - Миграция данных к шифрованию\n"
-        "🔧 <code>/admin</code> - Показать эту справку"
+        "🔧 <code>/admin</code> - Показать эту справку\n\n"
+        "ℹ️ Ежедневные бэкапы отправляются автоматически в 12:00 UTC"
     )
     
     await message.answer(admin_help, parse_mode="HTML")
