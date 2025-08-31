@@ -2,7 +2,6 @@ from aiogram import Router, types, F
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from datetime import datetime, timedelta
-import re
 import logging
 
 from database.connection import db
@@ -20,9 +19,69 @@ class DiaryStates(StatesGroup):
     waiting_for_period_end = State()
     waiting_for_edit = State()
 
+async def _get_user_timezone(user_id: int) -> str:
+    """Вспомогательная функция для получения часового пояса пользователя"""
+    async with db.pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT timezone FROM users WHERE user_id = $1", user_id)
+    return user['timezone'] if user else 'UTC'
+
+def _parse_date_input(date_input: str) -> datetime:
+    """Парсинг даты из строки с валидацией"""
+    return datetime.strptime(date_input.strip(), "%d.%m.%Y").date()
+
+def _create_date_keyboard(current_date):
+    """Создание клавиатуры выбора даты"""
+    yesterday = current_date - timedelta(days=1)
+    
+    return types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(
+            text=f"Сегодня ({current_date.strftime('%d.%m.%Y')})", 
+            callback_data=f"diary_date_{current_date.isoformat()}"
+        )],
+        [types.InlineKeyboardButton(
+            text=f"Вчера ({yesterday.strftime('%d.%m.%Y')})", 
+            callback_data=f"diary_date_{yesterday.isoformat()}"
+        )],
+        [types.InlineKeyboardButton(
+            text="📅 Выбрать другую дату", 
+            callback_data="diary_custom_date"
+        )]
+    ])
+
+def _create_view_menu_keyboard(current_date):
+    """Создание клавиатуры меню просмотра"""
+    return types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="Сегодня", callback_data=f"view_diary_{current_date.isoformat()}")],
+        [types.InlineKeyboardButton(text="Вчера", callback_data=f"view_diary_{(current_date - timedelta(days=1)).isoformat()}")],
+        [types.InlineKeyboardButton(text="📅 Своя дата", callback_data="view_diary_custom")],
+        [types.InlineKeyboardButton(text="📊 Выбрать период", callback_data="view_diary_period")]
+    ])
+
+def _decrypt_entry_safely(entry_content: str, entry_id: int) -> str:
+    """Безопасная расшифровка записи с обработкой ошибок"""
+    try:
+        from services.encryption_service import decrypt_text
+        return decrypt_text(entry_content)
+    except Exception as e:
+        logger.error(f"Failed to decrypt entry {entry_id}: {e}")
+        return "[Ошибка расшифровки]"
+
+async def _save_diary_entry(user_id: int, target_date, entry_text: str, message: types.Message):
+    """Сохранение записи в дневник с обработкой ошибок"""
+    try:
+        entry_id = await db.create_diary_entry(user_id, target_date, entry_text)
+        logger.info(f"Created diary entry {entry_id} for user {user_id} on {target_date}")
+        return True, entry_id
+    except Exception as e:
+        logger.error(f"Failed to create diary entry: {e}")
+        return False, None
+
 @router.message(lambda message: message.text == "✍️ Новая запись")
 async def create_diary_entry(message: types.Message, state: FSMContext):
     """Создание новой записи в дневнике"""
+    # Очищаем состояние перед началом нового процесса
+    await state.clear()
+    
     await message.answer(
         "✍️ Новая запись в дневнике\n\n"
         "Введите текст записи:",
@@ -40,35 +99,9 @@ async def process_diary_entry(message: types.Message, state: FSMContext):
     entry_text = message.text
     await state.update_data(entry_text=entry_text)
     
-    user_id = message.from_user.id
-    
-    # Получаем часовой пояс пользователя
-    async with db.pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT timezone FROM users WHERE user_id = $1", user_id)
-    
-    current_time = get_user_time(user['timezone'])
-    current_date = current_time.date()
-    
-    # Клавиатура выбора даты
-    keyboard_buttons = [
-        [types.InlineKeyboardButton(text=f"Сегодня ({current_date.strftime('%d.%m.%Y')})", 
-                                   callback_data=f"diary_date_{current_date.isoformat()}")]
-    ]
-    
-    # Добавляем вчера
-    yesterday = current_date - timedelta(days=1)
-    keyboard_buttons.append([
-        types.InlineKeyboardButton(
-            text=f"Вчера ({yesterday.strftime('%d.%m.%Y')})", 
-            callback_data=f"diary_date_{yesterday.isoformat()}"
-        )
-    ])
-    
-    keyboard_buttons.append([
-        types.InlineKeyboardButton(text="📅 Выбрать другую дату", callback_data="diary_custom_date")
-    ])
-    
-    keyboard = types.InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    user_timezone = await _get_user_timezone(message.from_user.id)
+    current_time = get_user_time(user_timezone)
+    keyboard = _create_date_keyboard(current_time.date())
     
     await message.answer(
         f"✅ Текст записи: {entry_text[:100]}{'...' if len(entry_text) > 100 else ''}\n\n"
@@ -87,19 +120,12 @@ async def ask_custom_date(callback: types.CallbackQuery, state: FSMContext):
 @router.message(DiaryStates.waiting_for_custom_date)
 async def process_custom_date(message: types.Message, state: FSMContext):
     """Обработка пользовательской даты"""
-    date_input = message.text.strip()
-    
     try:
-        # Проверяем формат даты
-        target_date = datetime.strptime(date_input, "%d.%m.%Y").date()
+        target_date = _parse_date_input(message.text)
         
         # Проверяем, что дата не в будущем
-        user_id = message.from_user.id
-        async with db.pool.acquire() as conn:
-            user = await conn.fetchrow("SELECT timezone FROM users WHERE user_id = $1", user_id)
-        
-        current_time = get_user_time(user['timezone'])
-        current_date = current_time.date()
+        user_timezone = await _get_user_timezone(message.from_user.id)
+        current_date = get_user_time(user_timezone).date()
         
         if target_date > current_date:
             await message.answer(
@@ -107,31 +133,22 @@ async def process_custom_date(message: types.Message, state: FSMContext):
             )
             return
         
-        # Сохраняем запись используя метод из database/connection.py
+        # Сохраняем запись
         data = await state.get_data()
-        entry_text = data.get("entry_text")
+        success, entry_id = await _save_diary_entry(
+            message.from_user.id, target_date, data.get("entry_text"), message
+        )
         
-        try:
-            entry_id = await db.create_diary_entry(user_id, target_date, entry_text)
-            logger.info(f"Created diary entry {entry_id} for user {user_id} on {target_date}")
-            
+        if success:
             await message.answer(
                 f"✅ Запись добавлена в дневник!\n\n"
                 f"📅 Дата: {target_date.strftime('%d.%m.%Y')}\n"
-                f"📝 Запись: {entry_text[:200]}{'...' if len(entry_text) > 200 else ''}"
+                f"📝 Запись: {data.get('entry_text')[:200]}{'...' if len(data.get('entry_text', '')) > 200 else ''}"
             )
-            
-            await message.answer(
-                "Что дальше?",
-                reply_markup=get_diary_menu_keyboard()
-            )
-            
+            await message.answer("Что дальше?", reply_markup=get_diary_menu_keyboard())
             await state.clear()
-        except Exception as e:
-            logger.error(f"Failed to create diary entry: {e}")
-            await message.answer(
-                "❌ Произошла ошибка при сохранении записи. Попробуйте еще раз."
-            )
+        else:
+            await message.answer("❌ Произошла ошибка при сохранении записи. Попробуйте еще раз.")
     
     except ValueError:
         await message.answer(
@@ -145,53 +162,30 @@ async def process_diary_date(callback: types.CallbackQuery, state: FSMContext):
     target_date = datetime.fromisoformat(date_str).date()
     
     data = await state.get_data()
-    entry_text = data.get("entry_text")
-    user_id = callback.from_user.id
+    success, entry_id = await _save_diary_entry(
+        callback.from_user.id, target_date, data.get("entry_text"), callback.message
+    )
     
-    # Сохраняем запись используя метод из database/connection.py
-    try:
-        entry_id = await db.create_diary_entry(user_id, target_date, entry_text)
-        logger.info(f"Created diary entry {entry_id} for user {user_id} on {target_date}")
-        
+    if success:
         await callback.message.edit_text(
             f"✅ Запись добавлена в дневник!\n\n"
             f"📅 Дата: {target_date.strftime('%d.%m.%Y')}\n"
-            f"📝 Запись: {entry_text[:200]}{'...' if len(entry_text) > 200 else ''}"
+            f"📝 Запись: {data.get('entry_text')[:200]}{'...' if len(data.get('entry_text', '')) > 200 else ''}"
         )
-        
-        await callback.message.answer(
-            "Что дальше?",
-            reply_markup=get_diary_menu_keyboard()
-        )
-        
+        await callback.message.answer("Что дальше?", reply_markup=get_diary_menu_keyboard())
         await state.clear()
-    except Exception as e:
-        logger.error(f"Failed to create diary entry: {e}")
-        await callback.message.edit_text(
-            "❌ Произошла ошибка при сохранении записи. Попробуйте еще раз."
-        )
+    else:
+        await callback.message.edit_text("❌ Произошла ошибка при сохранении записи. Попробуйте еще раз.")
 
 @router.message(lambda message: message.text == "📖 Просмотр записей")
-async def view_diary_entries(message: types.Message):
+async def view_diary_entries(message: types.Message, state: FSMContext):
     """Просмотр записей дневника"""
-    user_id = message.from_user.id
+    # Очищаем состояние перед просмотром
+    await state.clear()
     
-    # Получаем часовой пояс пользователя
-    async with db.pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT timezone FROM users WHERE user_id = $1", user_id)
-    
-    current_time = get_user_time(user['timezone'])
-    current_date = current_time.date()
-    
-    # Клавиатура для выбора периода просмотра
-    keyboard_buttons = [
-        [types.InlineKeyboardButton(text="Сегодня", callback_data=f"view_diary_{current_date.isoformat()}")],
-        [types.InlineKeyboardButton(text="Вчера", callback_data=f"view_diary_{(current_date - timedelta(days=1)).isoformat()}")],
-        [types.InlineKeyboardButton(text="📅 Своя дата", callback_data="view_diary_custom")],
-        [types.InlineKeyboardButton(text="📊 Выбрать период", callback_data="view_diary_period")]
-    ]
-    
-    keyboard = types.InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    user_timezone = await _get_user_timezone(message.from_user.id)
+    current_date = get_user_time(user_timezone).date()
+    keyboard = _create_view_menu_keyboard(current_date)
     
     await message.answer(
         "📖 Просмотр записей дневника\n\n"
@@ -210,10 +204,8 @@ async def ask_view_date(callback: types.CallbackQuery, state: FSMContext):
 @router.message(DiaryStates.waiting_for_date)
 async def process_view_date(message: types.Message, state: FSMContext):
     """Обработка даты для просмотра"""
-    date_input = message.text.strip()
-    
     try:
-        target_date = datetime.strptime(date_input, "%d.%m.%Y").date()
+        target_date = _parse_date_input(message.text)
         await show_entries_for_date(message, target_date, user_id=message.from_user.id)
         await state.clear()
     except ValueError:
@@ -232,10 +224,8 @@ async def ask_period_start(callback: types.CallbackQuery, state: FSMContext):
 @router.message(DiaryStates.waiting_for_period_start)
 async def process_period_start(message: types.Message, state: FSMContext):
     """Обработка начальной даты периода"""
-    date_input = message.text.strip()
-    
     try:
-        start_date = datetime.strptime(date_input, "%d.%m.%Y").date()
+        start_date = _parse_date_input(message.text)
         await state.update_data(start_date=start_date)
         
         await message.answer(
@@ -251,10 +241,8 @@ async def process_period_start(message: types.Message, state: FSMContext):
 @router.message(DiaryStates.waiting_for_period_end)
 async def process_period_end(message: types.Message, state: FSMContext):
     """Обработка конечной даты периода"""
-    date_input = message.text.strip()
-    
     try:
-        end_date = datetime.strptime(date_input, "%d.%m.%Y").date()
+        end_date = _parse_date_input(message.text)
         data = await state.get_data()
         start_date = data.get("start_date")
         
@@ -279,50 +267,8 @@ async def show_diary_entries(callback: types.CallbackQuery):
     
     await show_entries_for_date(callback.message, target_date, edit_message=True, user_id=callback.from_user.id)
 
-async def show_entries_for_date(message: types.Message, target_date, edit_message=False, user_id=None):
-    """Показать записи за конкретную дату с кнопками управления"""
-    if user_id is None:
-        user_id = message.from_user.id if hasattr(message, 'from_user') else message.chat.id
-    
-    try:
-        # Используем метод из database/connection.py для получения расшифрованных записей
-        entries = await db.get_diary_entries_by_date(user_id, target_date)
-        logger.info(f"Retrieved {len(entries)} diary entries for user {user_id} on {target_date}")
-    except Exception as e:
-        logger.error(f"Failed to retrieve diary entries: {e}")
-        await message.answer("❌ Произошла ошибка при получении записей")
-        return
-    
-    if not entries:
-        text = f"📖 За {target_date.strftime('%d.%m.%Y')} записей нет"
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="🔙 Назад к выбору", callback_data="back_to_view_menu")]
-        ])
-        if edit_message:
-            await message.edit_text(text, reply_markup=keyboard)
-        else:
-            await message.answer(text, reply_markup=keyboard)
-        return
-    
-    text = f"📖 Записи за {target_date.strftime('%d.%m.%Y')}:\n\n"
-    
-    for i, entry in enumerate(entries, 1):
-        edited_mark = " (edited)" if entry['is_edited'] else ""
-        time_str = entry['created_at'].strftime('%H:%M')
-        
-        # Получаем дату создания записи
-        created_date = entry['created_at'].date()
-        
-        # Если запись была создана на другую дату (не на target_date), показываем обе даты
-        if created_date != target_date:
-            date_info = f"📅 {created_date.strftime('%d.%m.%Y')} в {time_str}"
-        else:
-            date_info = f"🕐 {time_str}"
-        
-        text += f"{i}. {entry['content']}\n"
-        text += f"{date_info}{edited_mark}\n\n"
-    
-    # Создаем инлайн-клавиатуру с кнопками для каждой записи
+def _create_entry_keyboard(entries):
+    """Создание клавиатуры для управления записями"""
     keyboard_buttons = []
     
     for i, entry in enumerate(entries, 1):
@@ -342,7 +288,50 @@ async def show_entries_for_date(message: types.Message, target_date, edit_messag
         types.InlineKeyboardButton(text="🔙 Назад к выбору", callback_data="back_to_view_menu")
     ])
     
-    keyboard = types.InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    return types.InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+
+async def show_entries_for_date(message: types.Message, target_date, edit_message=False, user_id=None):
+    """Показать записи за конкретную дату с кнопками управления"""
+    if user_id is None:
+        user_id = message.from_user.id if hasattr(message, 'from_user') else message.chat.id
+    
+    try:
+        entries = await db.get_diary_entries_by_date(user_id, target_date)
+        logger.info(f"Retrieved {len(entries)} diary entries for user {user_id} on {target_date}")
+    except Exception as e:
+        logger.error(f"Failed to retrieve diary entries: {e}")
+        await message.answer("❌ Произошла ошибка при получении записей")
+        return
+    
+    if not entries:
+        text = f"📖 За {target_date.strftime('%d.%m.%Y')} записей нет"
+        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text="🔙 Назад к выбору", callback_data="back_to_view_menu")]
+        ])
+        
+        if edit_message:
+            await message.edit_text(text, reply_markup=keyboard)
+        else:
+            await message.answer(text, reply_markup=keyboard)
+        return
+    
+    # Формируем текст с записями
+    text = f"📖 Записи за {target_date.strftime('%d.%m.%Y')}:\n\n"
+    
+    for i, entry in enumerate(entries, 1):
+        edited_mark = " (edited)" if entry['is_edited'] else ""
+        time_str = entry['created_at'].strftime('%H:%M')
+        created_date = entry['created_at'].date()
+        
+        # Определяем информацию о дате
+        if created_date != target_date:
+            date_info = f"📅 {created_date.strftime('%d.%m.%Y')} в {time_str}"
+        else:
+            date_info = f"🕐 {time_str}"
+        
+        text += f"{i}. {entry['content']}\n{date_info}{edited_mark}\n\n"
+    
+    keyboard = _create_entry_keyboard(entries)
     
     if edit_message:
         await message.edit_text(text[:4000], reply_markup=keyboard)
@@ -355,7 +344,6 @@ async def show_entries_for_period(message: types.Message, start_date, end_date, 
         user_id = message.from_user.id if hasattr(message, 'from_user') else message.chat.id
     
     try:
-        # Используем метод из database/connection.py для получения расшифрованных записей
         entries = await db.get_diary_entries_by_period(user_id, start_date, end_date)
         logger.info(f"Retrieved {len(entries)} diary entries for user {user_id} for period {start_date} - {end_date}")
     except Exception as e:
@@ -369,6 +357,7 @@ async def show_entries_for_period(message: types.Message, start_date, end_date, 
         )
         return
     
+    # Формируем текст с записями по датам
     text = f"📖 Записи за период {start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}:\n\n"
     
     current_date = None
@@ -379,12 +368,10 @@ async def show_entries_for_period(message: types.Message, start_date, end_date, 
         
         edited_mark = " (edited)" if entry['is_edited'] else ""
         time_str = entry['created_at'].strftime('%H:%M')
-        
-        # Получаем дату создания записи
         created_date = entry['created_at'].date()
         entry_date = entry['entry_date']
         
-        # Если запись была создана на другую дату, показываем информацию о создании
+        # Информация о времени создания
         if created_date != entry_date:
             time_info = f"{time_str} (создано {created_date.strftime('%d.%m.%Y')})"
         else:
@@ -392,13 +379,12 @@ async def show_entries_for_period(message: types.Message, start_date, end_date, 
         
         text += f"• {entry['content']} - {time_info}{edited_mark}\n"
     
-    # Разбиваем на части, если текст слишком длинный
+    # Разбиваем длинный текст на части
     if len(text) > 4000:
         parts = []
         current_part = ""
-        lines = text.split('\n')
         
-        for line in lines:
+        for line in text.split('\n'):
             if len(current_part + line + '\n') > 4000:
                 parts.append(current_part)
                 current_part = line + '\n'
@@ -416,24 +402,9 @@ async def show_entries_for_period(message: types.Message, start_date, end_date, 
 @router.callback_query(lambda c: c.data == "back_to_view_menu")
 async def back_to_view_menu(callback: types.CallbackQuery):
     """Возврат к меню просмотра"""
-    user_id = callback.from_user.id
-    
-    # Получаем часовой пояс пользователя
-    async with db.pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT timezone FROM users WHERE user_id = $1", user_id)
-    
-    current_time = get_user_time(user['timezone'])
-    current_date = current_time.date()
-    
-    # Клавиатура для выбора периода просмотра
-    keyboard_buttons = [
-        [types.InlineKeyboardButton(text="Сегодня", callback_data=f"view_diary_{current_date.isoformat()}")],
-        [types.InlineKeyboardButton(text="Вчера", callback_data=f"view_diary_{(current_date - timedelta(days=1)).isoformat()}")],
-        [types.InlineKeyboardButton(text="📅 Своя дата", callback_data="view_diary_custom")],
-        [types.InlineKeyboardButton(text="📊 Выбрать период", callback_data="view_diary_period")]
-    ]
-    
-    keyboard = types.InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    user_timezone = await _get_user_timezone(callback.from_user.id)
+    current_date = get_user_time(user_timezone).date()
+    keyboard = _create_view_menu_keyboard(current_date)
     
     await callback.message.edit_text(
         "📖 Просмотр записей дневника\n\n"
@@ -458,12 +429,8 @@ async def edit_entry(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("Запись не найдена", show_alert=True)
         return
     
-    # Расшифровываем содержимое для отображения
-    try:
-        from services.encryption_service import decrypt_text
-        decrypted_content = decrypt_text(entry['content'])
-    except Exception as e:
-        logger.error(f"Failed to decrypt entry {entry_id} for editing: {e}")
+    decrypted_content = _decrypt_entry_safely(entry['content'], entry_id)
+    if decrypted_content == "[Ошибка расшифровки]":
         await callback.answer("❌ Ошибка при расшифровке записи", show_alert=True)
         return
     
@@ -484,13 +451,10 @@ async def process_edit(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     
     try:
-        # Обновляем запись используя метод из database/connection.py
         success = await db.update_diary_entry(entry_id, user_id, new_content)
         
         if success:
-            # Получаем дату записи для возврата к просмотру
             entry_date = await db.get_diary_entry_date(entry_id)
-            
             await message.answer("✅ Запись успешно обновлена!")
             await show_entries_for_date(message, entry_date, user_id=user_id)
             await state.clear()
@@ -517,13 +481,7 @@ async def delete_entry_confirm(callback: types.CallbackQuery):
         await callback.answer("Запись не найдена", show_alert=True)
         return
     
-    # Расшифровываем содержимое для отображения
-    try:
-        from services.encryption_service import decrypt_text
-        decrypted_content = decrypt_text(entry['content'])
-    except Exception as e:
-        logger.error(f"Failed to decrypt entry {entry_id} for deletion confirmation: {e}")
-        decrypted_content = "[Ошибка расшифровки]"
+    decrypted_content = _decrypt_entry_safely(entry['content'], entry_id)
     
     # Клавиатура подтверждения
     keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
@@ -548,11 +506,9 @@ async def delete_entry(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     
     try:
-        # Получаем дату записи перед удалением
         entry_date = await db.get_diary_entry_date(entry_id)
         
         if entry_date:
-            # Удаляем запись используя метод из database/connection.py
             success = await db.delete_diary_entry(entry_id, user_id)
             
             if success:
@@ -573,7 +529,6 @@ async def cancel_delete(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     
     try:
-        # Получаем дату записи для возврата к просмотру
         entry_date = await db.get_diary_entry_date(entry_id)
         
         if entry_date:
@@ -583,3 +538,4 @@ async def cancel_delete(callback: types.CallbackQuery):
     except Exception as e:
         logger.error(f"Failed to get diary entry date {entry_id}: {e}")
         await callback.answer("❌ Произошла ошибка", show_alert=True)
+

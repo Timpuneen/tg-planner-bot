@@ -7,10 +7,10 @@ import calendar
 import pytz
 import logging
 
-from services.timezone_service import convert_user_time_to_scheduler_timezone, get_scheduler_timezone
+from services.timezone_service import convert_user_time_to_scheduler_timezone, get_scheduler_timezone, get_user_time
 from database.connection import db
 from services.openai_service import generate_daily_motivation
-from services.encryption_service import decrypt_text  # Новый импорт
+from services.encryption_service import decrypt_text
 from aiogram import types
 
 logger = logging.getLogger(__name__)
@@ -72,61 +72,64 @@ class SchedulerService:
         self.scheduler.shutdown(wait=False)
         logger.info("Scheduler stopped")
 
+    def _decrypt_reminder_text(self, encrypted_text: str, reminder_id: int) -> str:
+        """Вспомогательный метод для расшифровки текста напоминаний"""
+        try:
+            return decrypt_text(encrypted_text)
+        except Exception as e:
+            logger.error(f"Failed to decrypt reminder {reminder_id}: {e}")
+            return "[Ошибка расшифровки]"
+
+    async def _load_reminders_by_type(self, reminder_type: str) -> list:
+        """Загрузка напоминаний определенного типа"""
+        conditions = {
+            'once': "r.reminder_type = 'once' AND r.is_active = TRUE AND r.trigger_time > NOW()",
+            'recurring': "r.reminder_type = 'recurring' AND r.is_active = TRUE"
+        }
+        
+        fields = {
+            'once': "r.reminder_id, r.user_id, r.text, r.trigger_time, u.timezone",
+            'recurring': "r.reminder_id, r.user_id, r.text, r.cron_expression, u.timezone"
+        }
+
+        async with db.pool.acquire() as conn:
+            return await conn.fetch(f"""
+                SELECT {fields[reminder_type]}
+                FROM reminders r
+                JOIN users u ON r.user_id = u.user_id
+                WHERE {conditions[reminder_type]}
+            """)
+
     async def load_active_reminders(self):
         """Загрузка всех активных напоминаний из базы данных с расшифровкой"""
         try:
-            async with db.pool.acquire() as conn:
-                once_reminders = await conn.fetch(
-                    """SELECT r.reminder_id, r.user_id, r.text, r.trigger_time, u.timezone
-                       FROM reminders r
-                       JOIN users u ON r.user_id = u.user_id
-                       WHERE r.reminder_type = 'once' AND r.is_active = TRUE 
-                       AND r.trigger_time > NOW()"""
+            # Загружаем разовые напоминания
+            once_reminders = await self._load_reminders_by_type('once')
+            for reminder in once_reminders:
+                decrypted_text = self._decrypt_reminder_text(reminder['text'], reminder['reminder_id'])
+                scheduler_time = convert_user_time_to_scheduler_timezone(
+                    reminder['trigger_time'],
+                    reminder['timezone'],
+                    get_scheduler_timezone()
+                )
+                await self.add_once_reminder(
+                    reminder['reminder_id'],
+                    reminder['user_id'],
+                    decrypted_text,
+                    scheduler_time
                 )
 
-                for reminder in once_reminders:
-                    # Расшифровываем текст напоминания
-                    try:
-                        decrypted_text = decrypt_text(reminder['text'])
-                    except Exception as e:
-                        logger.error(f"Failed to decrypt reminder {reminder['reminder_id']}: {e}")
-                        decrypted_text = "[Ошибка расшифровки]"
-
-                    scheduler_time = convert_user_time_to_scheduler_timezone(
-                        reminder['trigger_time'],
-                        reminder['timezone'],
-                        get_scheduler_timezone()
-                    )
-
-                    await self.add_once_reminder(
-                        reminder['reminder_id'],
-                        reminder['user_id'],
-                        decrypted_text,
-                        scheduler_time
-                    )
-
-                recurring_reminders = await conn.fetch(
-                    """SELECT r.reminder_id, r.user_id, r.text, r.cron_expression, u.timezone
-                       FROM reminders r
-                       JOIN users u ON r.user_id = u.user_id
-                       WHERE r.reminder_type = 'recurring' AND r.is_active = TRUE"""
+            # Загружаем повторяющиеся напоминания
+            recurring_reminders = await self._load_reminders_by_type('recurring')
+            for reminder in recurring_reminders:
+                decrypted_text = self._decrypt_reminder_text(reminder['text'], reminder['reminder_id'])
+                await self.add_recurring_reminder_with_timezone(
+                    reminder['reminder_id'],
+                    reminder['user_id'],
+                    decrypted_text,
+                    reminder['cron_expression'],
+                    reminder['timezone']
                 )
-
-                for reminder in recurring_reminders:
-                    # Расшифровываем текст напоминания
-                    try:
-                        decrypted_text = decrypt_text(reminder['text'])
-                    except Exception as e:
-                        logger.error(f"Failed to decrypt reminder {reminder['reminder_id']}: {e}")
-                        decrypted_text = "[Ошибка расшифровки]"
-
-                    await self.add_recurring_reminder_with_timezone(
-                        reminder['reminder_id'],
-                        reminder['user_id'],
-                        decrypted_text,
-                        reminder['cron_expression'],
-                        reminder['timezone']
-                    )
 
             logger.info(f"Loaded {len(once_reminders)} once and {len(recurring_reminders)} recurring reminders")
 
@@ -139,7 +142,6 @@ class SchedulerService:
         try:
             job_id = f"reminder_recurring_{reminder_id}"
             user_tz = pytz.timezone(user_timezone)
-
             trigger = parse_cron_expression(cron_expression, user_tz)
 
             self.scheduler.add_job(
@@ -160,25 +162,25 @@ class SchedulerService:
         Определяет тип напоминания по приоритету: год > месяц > неделя > день
         Возвращает (тип_периода, текст_сообщения)
         """
-        from services.timezone_service import get_user_time
-        
         current_time = get_user_time(user_timezone)
         today = current_time.date()
         
-        # Проверяем год (31 декабря)
+        messages = {
+            'year': "🎊 Год подходит к концу! Время подвести итоги года и поставить цели на следующий год.\n\nОтметьте выполненные задачи года и составьте новые!",
+            'month': "📅 Месяц подходит к концу! Время проанализировать достижения месяца.\n\nОтметьте выполненные задачи месяца и составьте новые!",
+            'week': "📊 Неделя завершается! Отличное время подвести итоги недели.\n\nОтметьте выполненные задачи недели и составьте новые!",
+            'day': "🌅 День подходит к концу! Время подвести итоги дня.\n\nОтметьте выполненные задачи дня и составьте новые!"
+        }
+        
+        # Проверяем приоритеты
         if today.month == 12 and today.day == 31:
-            return "год", "🎊 Год подходит к концу! Время подвести итоги года и поставить цели на следующий год.\n\nОтметьте выполненные задачи года и составьте новые!"
-        
-        # Проверяем месяц (последний день месяца)
-        if is_last_day_of_month(current_time):
-            return "месяц", "📅 Месяц подходит к концу! Время проанализировать достижения месяца.\n\nОтметьте выполненные задачи месяца и составьте новые!"
-        
-        # Проверяем неделю (воскресенье)
-        if today.weekday() == 6:  # 6 = воскресенье
-            return "неделя", "📊 Неделя завершается! Отличное время подвести итоги недели.\n\nОтметьте выполненные задачи недели и составьте новые!"
-        
-        # Обычный день
-        return "день", "🌅 День подходит к концу! Время подвести итоги дня.\n\nОтметьте выполненные задачи дня и составьте новые!"
+            return "год", messages['year']
+        elif is_last_day_of_month(current_time):
+            return "месяц", messages['month']
+        elif today.weekday() == 6:  # воскресенье
+            return "неделя", messages['week']
+        else:
+            return "день", messages['day']
 
     async def _wrapped_send_recurring_reminder(self, user_id: int, text: str, reminder_id: int, cron_expression: str):
         """
@@ -186,31 +188,28 @@ class SchedulerService:
         Теперь определяет тип напоминания по приоритету.
         """
         try:
-            # Получаем часовой пояс пользователя
+            # Получаем данные пользователя и напоминания одним запросом
             async with db.pool.acquire() as conn:
-                user = await conn.fetchrow("SELECT timezone FROM users WHERE user_id = $1", user_id)
+                user_reminder_data = await conn.fetchrow("""
+                    SELECT u.timezone, r.is_built_in
+                    FROM users u
+                    JOIN reminders r ON r.reminder_id = $1
+                    WHERE u.user_id = $2
+                """, reminder_id, user_id)
                 
-            if not user:
-                logger.error(f"User {user_id} not found")
+            if not user_reminder_data:
+                logger.error(f"User {user_id} or reminder {reminder_id} not found")
                 return
                 
-            # Проверяем, является ли это встроенным умным напоминанием
-            async with db.pool.acquire() as conn:
-                reminder = await conn.fetchrow(
-                    "SELECT is_built_in FROM reminders WHERE reminder_id = $1", 
-                    reminder_id
-                )
-            
-            if reminder and reminder['is_built_in']:
+            if user_reminder_data['is_built_in']:
                 # Для встроенного напоминания определяем приоритет
-                period_type, smart_message = self._get_reminder_message_by_priority(user['timezone'])
+                period_type, smart_message = self._get_reminder_message_by_priority(user_reminder_data['timezone'])
                 await self.send_reminder(user_id, smart_message, reminder_id, 'recurring')
                 logger.info(f"Sent smart {period_type} reminder to user {user_id}")
             else:
                 # Для обычных напоминаний с L проверяем последний день месяца
                 if "L" in cron_expression:
-                    from services.timezone_service import get_user_time
-                    current_time = get_user_time(user['timezone'])
+                    current_time = get_user_time(user_reminder_data['timezone'])
                     if not is_last_day_of_month(current_time):
                         return  # пропускаем не последний день месяца
                 
@@ -269,27 +268,20 @@ class SchedulerService:
 
     async def setup_system_tasks(self):
         """Системные задачи"""
+        system_jobs = [
+            ("daily_motivation", self.send_daily_motivation, CronTrigger(hour=8, minute=0)),
+            ("evening_review", self.send_evening_review, CronTrigger(hour=23, minute=0)),
+            ("overdue_check", self.check_overdue_tasks, CronTrigger(hour=0, minute=30))
+        ]
+
         try:
-            self.scheduler.add_job(
-                self.send_daily_motivation,
-                trigger=CronTrigger(hour=8, minute=0),
-                id="daily_motivation",
-                replace_existing=True
-            )
-
-            self.scheduler.add_job(
-                self.send_evening_review,
-                trigger=CronTrigger(hour=23, minute=0),
-                id="evening_review",
-                replace_existing=True
-            )
-
-            self.scheduler.add_job(
-                self.check_overdue_tasks,
-                trigger=CronTrigger(hour=0, minute=30),
-                id="overdue_check",
-                replace_existing=True
-            )
+            for job_id, func, trigger in system_jobs:
+                self.scheduler.add_job(
+                    func,
+                    trigger=trigger,
+                    id=job_id,
+                    replace_existing=True
+                )
 
             logger.info("System tasks setup completed")
 
@@ -329,6 +321,45 @@ class SchedulerService:
         except Exception as e:
             logger.error(f"Error in send_evening_review: {e}")
 
+    def _decrypt_content_safely(self, content: str, content_type: str, user_id: int) -> str:
+        """Безопасная расшифровка контента с обработкой ошибок"""
+        try:
+            return decrypt_text(content)
+        except Exception as e:
+            logger.error(f"Failed to decrypt {content_type} for user {user_id}: {e}")
+            return "[Ошибка расшифровки]"
+
+    def _group_tasks_by_status(self, tasks: list, user_id: int) -> dict:
+        """Группировка задач по статусам с расшифровкой"""
+        groups = {
+            'completed': [],
+            'failed': [],
+            'active': [],
+            'overdue': []
+        }
+        
+        for task in tasks:
+            decrypted_text = self._decrypt_content_safely(task['text'], 'task', user_id)
+            task_dict = dict(task)
+            task_dict['text'] = decrypted_text
+            
+            if task['status'] in groups:
+                groups[task['status']].append(task_dict)
+        
+        return groups
+
+    def _format_task_group(self, tasks: list, title: str, icon: str) -> str:
+        """Форматирование группы задач для отображения"""
+        if not tasks:
+            return ""
+        
+        result = f"{icon} {title}:\n"
+        for task in tasks:
+            category_text = f" ({task['category']})" if task['category'] else ""
+            result += f"  • {task['text']}{category_text}\n"
+        result += "\n"
+        return result
+
     async def send_user_evening_review(self, user_id: int):
         """Формирует и отправляет ревью дня конкретному пользователю с расшифровкой данных"""
         try:
@@ -338,7 +369,6 @@ class SchedulerService:
                     logger.error(f"User {user_id} not found")
                     return
 
-            from services.timezone_service import get_user_time
             current_time = get_user_time(user['timezone'])
             today = current_time.date()
             yesterday = today - timedelta(days=1)
@@ -346,8 +376,9 @@ class SchedulerService:
             today_utc_start, today_utc_end = self._get_day_utc_bounds(today, user['timezone'])
             yesterday_utc_start, yesterday_utc_end = self._get_day_utc_bounds(yesterday, user['timezone'])
 
-            # Получаем записи дневника за сегодня (зашифрованные)
+            # Получаем данные одним блоком запросов
             async with db.pool.acquire() as conn:
+                # Записи дневника
                 diary_entries = await conn.fetch(
                     """SELECT content, created_at FROM diary_entries 
                        WHERE user_id = $1 AND entry_date = $2
@@ -355,21 +386,14 @@ class SchedulerService:
                     user_id, today
                 )
 
-                # Получаем релевантные задачи для ревью (зашифрованные)
+                # Релевантные задачи для ревью
                 review_tasks = await conn.fetch(
                     """SELECT text, category, status, deadline, completed_at FROM tasks 
                        WHERE user_id = $1 AND (
-                           -- Задачи выполненные сегодня
                            (status = 'completed' AND completed_at >= $2 AND completed_at <= $3)
-                           OR
-                           -- Задачи помеченные как невыполненные сегодня  
-                           (status = 'failed' AND completed_at >= $2 AND completed_at <= $3)
-                           OR
-                           -- Активные задачи с дедлайном сегодня
-                           (status = 'active' AND deadline IS NOT NULL AND deadline >= $2 AND deadline <= $3)
-                           OR
-                           -- Задачи которые стали просроченными сегодня (дедлайн был вчера)
-                           (status = 'overdue' AND deadline IS NOT NULL AND deadline >= $4 AND deadline <= $5)
+                           OR (status = 'failed' AND completed_at >= $2 AND completed_at <= $3)
+                           OR (status = 'active' AND deadline IS NOT NULL AND deadline >= $2 AND deadline <= $3)
+                           OR (status = 'overdue' AND deadline IS NOT NULL AND deadline >= $4 AND deadline <= $5)
                        )
                        ORDER BY status, category NULLS LAST""",
                     user_id, today_utc_start, today_utc_end, yesterday_utc_start, yesterday_utc_end
@@ -383,14 +407,7 @@ class SchedulerService:
                 review_text += "📝 Записи дневника:\n"
                 for entry in diary_entries:
                     time_str = entry['created_at'].strftime('%H:%M')
-                    
-                    # Расшифровываем содержимое записи
-                    try:
-                        decrypted_content = decrypt_text(entry['content'])
-                    except Exception as e:
-                        logger.error(f"Failed to decrypt diary entry for user {user_id}: {e}")
-                        decrypted_content = "[Ошибка расшифровки]"
-                    
+                    decrypted_content = self._decrypt_content_safely(entry['content'], 'diary entry', user_id)
                     # Обрезаем длинные записи
                     content = decrypted_content[:150] + ('...' if len(decrypted_content) > 150 else '')
                     review_text += f"• {time_str} - {content}\n"
@@ -398,64 +415,16 @@ class SchedulerService:
             else:
                 review_text += "📝 Записей дневника за день нет\n\n"
 
-            # Задачи для ревью с расшифровкой
+            # Задачи для ревью с расшифровкой и группировкой
             if review_tasks:
                 review_text += "📋 Задачи:\n"
+                task_groups = self._group_tasks_by_status(review_tasks, user_id)
                 
-                # Группируем задачи по статусам и расшифровываем
-                completed_today = []
-                failed_today = []
-                active_due_today = []
-                overdue_today = []
-                
-                for task in review_tasks:
-                    # Расшифровываем текст задачи
-                    try:
-                        decrypted_task_text = decrypt_text(task['text'])
-                    except Exception as e:
-                        logger.error(f"Failed to decrypt task for user {user_id}: {e}")
-                        decrypted_task_text = "[Ошибка расшифровки]"
-                    
-                    task_dict = dict(task)
-                    task_dict['text'] = decrypted_task_text
-                    
-                    if task['status'] == 'completed':
-                        completed_today.append(task_dict)
-                    elif task['status'] == 'failed':
-                        failed_today.append(task_dict)
-                    elif task['status'] == 'active':
-                        active_due_today.append(task_dict)
-                    elif task['status'] == 'overdue':
-                        overdue_today.append(task_dict)
-                
-                if completed_today:
-                    review_text += "✅ Выполнено сегодня:\n"
-                    for task in completed_today:
-                        category_text = f" ({task['category']})" if task['category'] else ""
-                        review_text += f"  • {task['text']}{category_text}\n"
-                    review_text += "\n"
-                
-                if failed_today:
-                    review_text += "❌ Отмечено невыполненными сегодня:\n"
-                    for task in failed_today:
-                        category_text = f" ({task['category']})" if task['category'] else ""
-                        review_text += f"  • {task['text']}{category_text}\n"
-                    review_text += "\n"
-                
-                if active_due_today:
-                    review_text += "🔥 Активные с дедлайном сегодня:\n"
-                    for task in active_due_today:
-                        category_text = f" ({task['category']})" if task['category'] else ""
-                        review_text += f"  • {task['text']}{category_text}\n"
-                    review_text += "\n"
-                
-                if overdue_today:
-                    review_text += "⚠️ Стали просроченными сегодня:\n"
-                    for task in overdue_today:
-                        category_text = f" ({task['category']})" if task['category'] else ""
-                        review_text += f"  • {task['text']}{category_text}\n"
-                    review_text += "\n"
-                
+                # Форматируем каждую группу задач
+                review_text += self._format_task_group(task_groups['completed'], "Выполнено сегодня", "✅")
+                review_text += self._format_task_group(task_groups['failed'], "Отмечено невыполненными сегодня", "❌")
+                review_text += self._format_task_group(task_groups['active'], "Активные с дедлайном сегодня", "🔥")
+                review_text += self._format_task_group(task_groups['overdue'], "Стали просроченными сегодня", "⚠️")
             else:
                 review_text += "📋 Релевантных задач за день нет\n\n"
 
@@ -469,14 +438,10 @@ class SchedulerService:
 
     def _get_day_utc_bounds(self, date, timezone_str):
         """Получает UTC границы дня для заданной даты в часовом поясе пользователя"""
-        import pytz
-        from datetime import datetime, time
-        
         user_tz = pytz.timezone(timezone_str)
         
-        # Начало дня (00:00:00) в пользовательском часовом поясе
+        # Начало и конец дня в пользовательском часовом поясе
         day_start_local = user_tz.localize(datetime.combine(date, time.min))
-        # Конец дня (23:59:59) в пользовательском часовом поясе  
         day_end_local = user_tz.localize(datetime.combine(date, time.max))
         
         # Конвертируем в UTC и убираем timezone info для БД
@@ -487,41 +452,38 @@ class SchedulerService:
 
     async def check_overdue_tasks(self):
         """Проверка и пометка просроченных задач"""
+        TASK_LIMITS = {
+            'active': 50,
+            'completed': 50,
+            'failed': 25,
+            'overdue': 25
+        }
+        
         try:
-            # Импортируем лимиты задач
-            TASK_LIMITS = {
-                'active': 50,
-                'completed': 50,
-                'failed': 25,
-                'overdue': 25
-            }
-            
             async with db.pool.acquire() as conn:
-                # Получаем всех пользователей с их часовыми поясами
                 users = await conn.fetch("SELECT user_id, timezone FROM users")
                 
                 for user in users:
                     try:
-                        from services.timezone_service import get_user_time
                         user_tz = pytz.timezone(user['timezone'])
                         current_time = get_user_time(user['timezone'])
                         current_utc = self._normalize_datetime_for_db(current_time)
                         
-                        # Проверяем активные задачи с дедлайном
-                        overdue_tasks = await conn.fetch(
-                            """SELECT task_id FROM tasks 
-                               WHERE user_id = $1 AND status = 'active' 
-                               AND deadline IS NOT NULL AND deadline < $2""",
-                            user['user_id'], current_utc
-                        )
-                        
-                        if overdue_tasks:
-                            # Проверяем лимит просроченных задач
-                            overdue_count = await conn.fetchval(
+                        # Получаем просроченные задачи и текущее количество
+                        overdue_tasks, overdue_count = await asyncio.gather(
+                            conn.fetch(
+                                """SELECT task_id FROM tasks 
+                                   WHERE user_id = $1 AND status = 'active' 
+                                   AND deadline IS NOT NULL AND deadline < $2""",
+                                user['user_id'], current_utc
+                            ),
+                            conn.fetchval(
                                 "SELECT COUNT(*) FROM tasks WHERE user_id = $1 AND status = 'overdue'",
                                 user['user_id']
                             )
-                            
+                        )
+                        
+                        if overdue_tasks:
                             tasks_to_mark = len(overdue_tasks)
                             
                             # Если превышаем лимит, удаляем самые старые просроченные
@@ -559,7 +521,6 @@ class SchedulerService:
         
         # Если datetime содержит timezone info, конвертируем в UTC и убираем timezone info
         if dt.tzinfo is not None:
-            # Конвертируем в UTC и делаем naive
             utc_dt = dt.astimezone(pytz.UTC)
             return utc_dt.replace(tzinfo=None)
         

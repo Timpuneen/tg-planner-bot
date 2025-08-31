@@ -25,92 +25,100 @@ class Database:
             await self.pool.close()
             logger.info("Database connection closed")
     
+    def _encrypt_text(self, text: str) -> str:
+        """Вспомогательный метод для шифрования"""
+        from services.encryption_service import encrypt_text
+        return encrypt_text(text)
+    
+    def _decrypt_text(self, encrypted_text: str, item_id: int = None, item_type: str = "item") -> str:
+        """Вспомогательный метод для расшифровки"""
+        from services.encryption_service import decrypt_text
+        try:
+            return decrypt_text(encrypted_text)
+        except Exception as e:
+            logger.error(f"Failed to decrypt {item_type} {item_id}: {e}")
+            return "[Ошибка расшифровки]"
+    
+    def _decrypt_items(self, items: List[Any], text_field: str, id_field: str, item_type: str) -> List[Dict[str, Any]]:
+        """Универсальный метод для расшифровки списка элементов"""
+        decrypted_items = []
+        for item in items:
+            item_dict = dict(item)
+            item_dict[text_field] = self._decrypt_text(
+                item[text_field], 
+                item[id_field], 
+                item_type
+            )
+            decrypted_items.append(item_dict)
+        return decrypted_items
+    
     async def create_tables(self):
         """Создание таблиц в базе данных"""
-        async with self.pool.acquire() as conn:
+        tables_sql = [
             # Таблица пользователей
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY,
-                    timezone VARCHAR(50) NOT NULL,
-                    created_at TIMESTAMP DEFAULT NOW()
-                )
-            """)
+            """CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                timezone VARCHAR(50) NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            )""",
             
             # Таблица напоминаний
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS reminders (
-                    reminder_id SERIAL PRIMARY KEY,
-                    user_id BIGINT REFERENCES users(user_id),
-                    text TEXT NOT NULL,
-                    reminder_type VARCHAR(20) NOT NULL,
-                    trigger_time TIMESTAMP,
-                    cron_expression VARCHAR(100),
-                    is_active BOOLEAN DEFAULT TRUE,
-                    is_built_in BOOLEAN DEFAULT FALSE,
-                    created_at TIMESTAMP DEFAULT NOW()
-                )
-            """)
+            """CREATE TABLE IF NOT EXISTS reminders (
+                reminder_id SERIAL PRIMARY KEY,
+                user_id BIGINT REFERENCES users(user_id),
+                text TEXT NOT NULL,
+                reminder_type VARCHAR(20) NOT NULL,
+                trigger_time TIMESTAMP,
+                cron_expression VARCHAR(100),
+                is_active BOOLEAN DEFAULT TRUE,
+                is_built_in BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT NOW()
+            )""",
             
             # Таблица задач
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS tasks (
-                    task_id SERIAL PRIMARY KEY,
-                    user_id BIGINT REFERENCES users(user_id),
-                    text TEXT NOT NULL,
-                    category VARCHAR(100),
-                    deadline TIMESTAMP,
-                    status VARCHAR(20) DEFAULT 'active',
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    completed_at TIMESTAMP,
-                    marked_overdue_at TIMESTAMP
-                )
-            """)
+            """CREATE TABLE IF NOT EXISTS tasks (
+                task_id SERIAL PRIMARY KEY,
+                user_id BIGINT REFERENCES users(user_id),
+                text TEXT NOT NULL,
+                category VARCHAR(100),
+                deadline TIMESTAMP,
+                status VARCHAR(20) DEFAULT 'active',
+                created_at TIMESTAMP DEFAULT NOW(),
+                completed_at TIMESTAMP,
+                marked_overdue_at TIMESTAMP
+            )""",
 
             # Таблица для категорий задач
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS task_categories (
-                    category_id SERIAL PRIMARY KEY,
-                    user_id BIGINT REFERENCES users(user_id),
-                    name VARCHAR(100) NOT NULL,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    UNIQUE(user_id, name)
-                )
-            """)
+            """CREATE TABLE IF NOT EXISTS task_categories (
+                category_id SERIAL PRIMARY KEY,
+                user_id BIGINT REFERENCES users(user_id),
+                name VARCHAR(100) NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(user_id, name)
+            )""",
 
-            # Обновленная таблица записей дневника
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS diary_entries (
-                    entry_id SERIAL PRIMARY KEY,
-                    user_id BIGINT REFERENCES users(user_id),
-                    entry_date DATE NOT NULL,
-                    content TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    updated_at TIMESTAMP DEFAULT NOW(),
-                    is_edited BOOLEAN DEFAULT FALSE
-                )
-            """)
-
-            # Добавляем индексы для оптимизации
-            await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_tasks_user_status 
-                ON tasks(user_id, status)
-            """)
-
-            await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_tasks_deadline 
-                ON tasks(deadline) WHERE deadline IS NOT NULL
-            """)
-
-            await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_task_categories_user 
-                ON task_categories(user_id, created_at DESC)
-            """)
-
-            await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_diary_entries_user_date 
-                ON diary_entries(user_id, entry_date DESC)
-            """)
+            # Таблица записей дневника
+            """CREATE TABLE IF NOT EXISTS diary_entries (
+                entry_id SERIAL PRIMARY KEY,
+                user_id BIGINT REFERENCES users(user_id),
+                entry_date DATE NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW(),
+                is_edited BOOLEAN DEFAULT FALSE
+            )"""
+        ]
+        
+        indexes_sql = [
+            "CREATE INDEX IF NOT EXISTS idx_tasks_user_status ON tasks(user_id, status)",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_deadline ON tasks(deadline) WHERE deadline IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_task_categories_user ON task_categories(user_id, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_diary_entries_user_date ON diary_entries(user_id, entry_date DESC)"
+        ]
+        
+        async with self.pool.acquire() as conn:
+            for sql in tables_sql + indexes_sql:
+                await conn.execute(sql)
         
         logger.info("Database tables created/verified")
     
@@ -118,9 +126,7 @@ class Database:
     
     async def create_task(self, user_id: int, text: str, category: str = None, deadline=None) -> int:
         """Создание новой задачи с шифрованием"""
-        from services.encryption_service import encrypt_text
-        
-        encrypted_text = encrypt_text(text)
+        encrypted_text = self._encrypt_text(text)
         
         async with self.pool.acquire() as conn:
             task_id = await conn.fetchval(
@@ -133,36 +139,16 @@ class Database:
     
     async def get_user_tasks(self, user_id: int, status: str = None) -> List[Dict[str, Any]]:
         """Получение задач пользователя с расшифровкой"""
-        from services.encryption_service import decrypt_text
+        base_query = """SELECT task_id, text, category, deadline, status, created_at, completed_at, marked_overdue_at
+                       FROM tasks WHERE user_id = $1"""
         
         async with self.pool.acquire() as conn:
             if status:
-                tasks = await conn.fetch(
-                    """SELECT task_id, text, category, deadline, status, created_at, completed_at, marked_overdue_at
-                       FROM tasks WHERE user_id = $1 AND status = $2 
-                       ORDER BY created_at DESC""",
-                    user_id, status
-                )
+                tasks = await conn.fetch(f"{base_query} AND status = $2 ORDER BY created_at DESC", user_id, status)
             else:
-                tasks = await conn.fetch(
-                    """SELECT task_id, text, category, deadline, status, created_at, completed_at, marked_overdue_at
-                       FROM tasks WHERE user_id = $1 
-                       ORDER BY created_at DESC""",
-                    user_id
-                )
+                tasks = await conn.fetch(f"{base_query} ORDER BY created_at DESC", user_id)
         
-        # Расшифровываем текст задач
-        decrypted_tasks = []
-        for task in tasks:
-            task_dict = dict(task)
-            try:
-                task_dict['text'] = decrypt_text(task['text'])
-            except Exception as e:
-                logger.error(f"Failed to decrypt task {task['task_id']}: {e}")
-                task_dict['text'] = "[Ошибка расшифровки]"
-            decrypted_tasks.append(task_dict)
-        
-        return decrypted_tasks
+        return self._decrypt_items(tasks, 'text', 'task_id', 'task')
     
     async def update_task_status(self, task_id: int, user_id: int, status: str) -> bool:
         """Обновление статуса задачи"""
@@ -191,9 +177,7 @@ class Database:
                             trigger_time=None, cron_expression: str = None, 
                             is_built_in: bool = False) -> int:
         """Создание нового напоминания с шифрованием"""
-        from services.encryption_service import encrypt_text
-        
-        encrypted_text = encrypt_text(text)
+        encrypted_text = self._encrypt_text(text)
         
         async with self.pool.acquire() as conn:
             reminder_id = await conn.fetchval(
@@ -206,8 +190,6 @@ class Database:
     
     async def get_user_reminders(self, user_id: int) -> List[Dict[str, Any]]:
         """Получение напоминаний пользователя с расшифровкой"""
-        from services.encryption_service import decrypt_text
-        
         async with self.pool.acquire() as conn:
             reminders = await conn.fetch(
                 """SELECT reminder_id, text, reminder_type, trigger_time, cron_expression, 
@@ -218,23 +200,10 @@ class Database:
                 user_id
             )
         
-        # Расшифровываем текст напоминаний
-        decrypted_reminders = []
-        for reminder in reminders:
-            reminder_dict = dict(reminder)
-            try:
-                reminder_dict['text'] = decrypt_text(reminder['text'])
-            except Exception as e:
-                logger.error(f"Failed to decrypt reminder {reminder['reminder_id']}: {e}")
-                reminder_dict['text'] = "[Ошибка расшифровки]"
-            decrypted_reminders.append(reminder_dict)
-        
-        return decrypted_reminders
+        return self._decrypt_items(reminders, 'text', 'reminder_id', 'reminder')
     
     async def get_active_reminders(self) -> List[Dict[str, Any]]:
         """Получение всех активных напоминаний для планировщика"""
-        from services.encryption_service import decrypt_text
-        
         async with self.pool.acquire() as conn:
             reminders = await conn.fetch(
                 """SELECT reminder_id, user_id, text, reminder_type, trigger_time, cron_expression
@@ -242,18 +211,7 @@ class Database:
                    WHERE is_active = TRUE"""
             )
         
-        # Расшифровываем текст напоминаний
-        decrypted_reminders = []
-        for reminder in reminders:
-            reminder_dict = dict(reminder)
-            try:
-                reminder_dict['text'] = decrypt_text(reminder['text'])
-            except Exception as e:
-                logger.error(f"Failed to decrypt reminder {reminder['reminder_id']}: {e}")
-                reminder_dict['text'] = "[Ошибка расшифровки]"
-            decrypted_reminders.append(reminder_dict)
-        
-        return decrypted_reminders
+        return self._decrypt_items(reminders, 'text', 'reminder_id', 'reminder')
     
     async def update_reminder_status(self, reminder_id: int, is_active: bool) -> bool:
         """Обновление статуса напоминания"""
@@ -277,9 +235,7 @@ class Database:
     
     async def create_diary_entry(self, user_id: int, entry_date, content: str) -> int:
         """Создание новой записи дневника с шифрованием"""
-        from services.encryption_service import encrypt_text
-        
-        encrypted_content = encrypt_text(content)
+        encrypted_content = self._encrypt_text(content)
         
         async with self.pool.acquire() as conn:
             entry_id = await conn.fetchval(
@@ -292,8 +248,6 @@ class Database:
     
     async def get_diary_entries_by_date(self, user_id: int, entry_date) -> List[Dict[str, Any]]:
         """Получение записей дневника за определенную дату с расшифровкой"""
-        from services.encryption_service import decrypt_text
-        
         async with self.pool.acquire() as conn:
             entries = await conn.fetch(
                 """SELECT entry_id, content, created_at, is_edited 
@@ -303,23 +257,10 @@ class Database:
                 user_id, entry_date
             )
         
-        # Расшифровываем содержимое записей
-        decrypted_entries = []
-        for entry in entries:
-            entry_dict = dict(entry)
-            try:
-                entry_dict['content'] = decrypt_text(entry['content'])
-            except Exception as e:
-                logger.error(f"Failed to decrypt diary entry {entry['entry_id']}: {e}")
-                entry_dict['content'] = "[Ошибка расшифровки]"
-            decrypted_entries.append(entry_dict)
-        
-        return decrypted_entries
+        return self._decrypt_items(entries, 'content', 'entry_id', 'diary entry')
     
     async def get_diary_entries_by_period(self, user_id: int, start_date, end_date) -> List[Dict[str, Any]]:
         """Получение записей дневника за период с расшифровкой"""
-        from services.encryption_service import decrypt_text
-        
         async with self.pool.acquire() as conn:
             entries = await conn.fetch(
                 """SELECT entry_date, content, created_at, is_edited 
@@ -329,24 +270,18 @@ class Database:
                 user_id, start_date, end_date
             )
         
-        # Расшифровываем содержимое записей
+        # Здесь нет entry_id, поэтому используем другой подход
         decrypted_entries = []
         for entry in entries:
             entry_dict = dict(entry)
-            try:
-                entry_dict['content'] = decrypt_text(entry['content'])
-            except Exception as e:
-                logger.error(f"Failed to decrypt diary entry: {e}")
-                entry_dict['content'] = "[Ошибка расшифровки]"
+            entry_dict['content'] = self._decrypt_text(entry['content'], item_type="diary entry")
             decrypted_entries.append(entry_dict)
         
         return decrypted_entries
     
     async def update_diary_entry(self, entry_id: int, user_id: int, content: str) -> bool:
         """Обновление записи дневника с шифрованием"""
-        from services.encryption_service import encrypt_text
-        
-        encrypted_content = encrypt_text(content)
+        encrypted_content = self._encrypt_text(content)
         
         async with self.pool.acquire() as conn:
             result = await conn.execute(
@@ -405,79 +340,42 @@ class Database:
     
     # === МИГРАЦИЯ СУЩЕСТВУЮЩИХ ДАННЫХ ===
     
+    async def _migrate_table_data(self, conn, table: str, id_field: str, text_field: str):
+        """Универсальный метод для миграции данных таблицы"""
+        items = await conn.fetch(f"SELECT {id_field}, {text_field} FROM {table}")
+        
+        for item in items:
+            try:
+                # Проверяем, не зашифровано ли уже
+                try:
+                    self._decrypt_text(item[text_field])
+                    continue  # Уже зашифровано
+                except:
+                    pass  # Не зашифровано, нужно зашифровать
+                
+                encrypted_text = self._encrypt_text(item[text_field])
+                await conn.execute(
+                    f"UPDATE {table} SET {text_field} = $1 WHERE {id_field} = $2",
+                    encrypted_text, item[id_field]
+                )
+                logger.info(f"Migrated {table} {item[id_field]}")
+            except Exception as e:
+                logger.error(f"Failed to migrate {table} {item[id_field]}: {e}")
+    
     async def migrate_existing_data_to_encrypted(self):
         """Миграция существующих незашифрованных данных"""
-        from services.encryption_service import encrypt_text
-        
         logger.info("Starting data migration to encrypted format...")
         
         async with self.pool.acquire() as conn:
-            # Миграция задач
-            tasks = await conn.fetch("SELECT task_id, text FROM tasks")
-            for task in tasks:
-                try:
-                    # Проверяем, не зашифрован ли уже текст
-                    # Если текст можно расшифровать, значит он уже зашифрован
-                    from services.encryption_service import decrypt_text
-                    try:
-                        decrypt_text(task['text'])
-                        continue  # Уже зашифровано
-                    except:
-                        # Не зашифровано, нужно зашифровать
-                        pass
-                    
-                    encrypted_text = encrypt_text(task['text'])
-                    await conn.execute(
-                        "UPDATE tasks SET text = $1 WHERE task_id = $2",
-                        encrypted_text, task['task_id']
-                    )
-                    logger.info(f"Migrated task {task['task_id']}")
-                except Exception as e:
-                    logger.error(f"Failed to migrate task {task['task_id']}: {e}")
+            # Миграция всех таблиц с зашифрованными данными
+            migrations = [
+                ("tasks", "task_id", "text"),
+                ("reminders", "reminder_id", "text"),
+                ("diary_entries", "entry_id", "content")
+            ]
             
-            # Миграция напоминаний
-            reminders = await conn.fetch("SELECT reminder_id, text FROM reminders")
-            for reminder in reminders:
-                try:
-                    # Проверяем, не зашифровано ли уже
-                    from services.encryption_service import decrypt_text
-                    try:
-                        decrypt_text(reminder['text'])
-                        continue  # Уже зашифровано
-                    except:
-                        # Не зашифровано, нужно зашифровать
-                        pass
-                    
-                    encrypted_text = encrypt_text(reminder['text'])
-                    await conn.execute(
-                        "UPDATE reminders SET text = $1 WHERE reminder_id = $2",
-                        encrypted_text, reminder['reminder_id']
-                    )
-                    logger.info(f"Migrated reminder {reminder['reminder_id']}")
-                except Exception as e:
-                    logger.error(f"Failed to migrate reminder {reminder['reminder_id']}: {e}")
-            
-            # Миграция записей дневника
-            diary_entries = await conn.fetch("SELECT entry_id, content FROM diary_entries")
-            for entry in diary_entries:
-                try:
-                    # Проверяем, не зашифровано ли уже
-                    from services.encryption_service import decrypt_text
-                    try:
-                        decrypt_text(entry['content'])
-                        continue  # Уже зашифровано
-                    except:
-                        # Не зашифровано, нужно зашифровать
-                        pass
-                    
-                    encrypted_content = encrypt_text(entry['content'])
-                    await conn.execute(
-                        "UPDATE diary_entries SET content = $1 WHERE entry_id = $2",
-                        encrypted_content, entry['entry_id']
-                    )
-                    logger.info(f"Migrated diary entry {entry['entry_id']}")
-                except Exception as e:
-                    logger.error(f"Failed to migrate diary entry {entry['entry_id']}: {e}")
+            for table, id_field, text_field in migrations:
+                await self._migrate_table_data(conn, table, id_field, text_field)
         
         logger.info("Data migration to encrypted format completed")
 

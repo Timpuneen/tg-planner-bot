@@ -2,8 +2,6 @@ from aiogram import Router, types
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from datetime import datetime
-import pytz
-import re
 
 from database.connection import db
 from keyboards.keyboards import get_reminders_menu_keyboard, get_back_to_main_keyboard
@@ -69,6 +67,17 @@ def parse_cron_description(cron_expression):
         else:
             return f"каждый год {day} {month_name} в {time_str}"
     
+    # Словарь дней недели для сокращения повторений
+    weekdays = {
+        '1': ('понедельник', 'понедельник'), 
+        '2': ('вторник', 'вторник'),
+        '3': ('среду', 'среду'),
+        '4': ('четверг', 'четверг'),
+        '5': ('пятницу', 'пятницу'),
+        '6': ('субботу', 'субботу'),
+        '0': ('воскресенье', 'воскресенье')
+    }
+    
     # Расширенные паттерны для различных cron выражений
     cron_patterns = {
         # Интервальные выражения
@@ -79,22 +88,6 @@ def parse_cron_description(cron_expression):
         # Ежедневные
         r'0 (\d+) \* \* \*': lambda m: f"каждый день в {m.group(1):0>2}:00",
         r'(\d+) (\d+) \* \* \*': lambda m: f"каждый день в {m.group(2):0>2}:{m.group(1):0>2}",
-        
-        # Еженедельные (0 = воскресенье, 1 = понедельник, ..., 6 = суббота)
-        r'0 (\d+) \* \* 1': lambda m: f"каждый понедельник в {m.group(1):0>2}:00",
-        r'(\d+) (\d+) \* \* 1': lambda m: f"каждый понедельник в {m.group(2):0>2}:{m.group(1):0>2}",
-        r'0 (\d+) \* \* 2': lambda m: f"каждый вторник в {m.group(1):0>2}:00",
-        r'(\d+) (\d+) \* \* 2': lambda m: f"каждый вторник в {m.group(2):0>2}:{m.group(1):0>2}",
-        r'0 (\d+) \* \* 3': lambda m: f"каждую среду в {m.group(1):0>2}:00",
-        r'(\d+) (\d+) \* \* 3': lambda m: f"каждую среду в {m.group(2):0>2}:{m.group(1):0>2}",
-        r'0 (\d+) \* \* 4': lambda m: f"каждый четверг в {m.group(1):0>2}:00",
-        r'(\d+) (\d+) \* \* 4': lambda m: f"каждый четверг в {m.group(2):0>2}:{m.group(1):0>2}",
-        r'0 (\d+) \* \* 5': lambda m: f"каждую пятницу в {m.group(1):0>2}:00",
-        r'(\d+) (\d+) \* \* 5': lambda m: f"каждую пятницу в {m.group(2):0>2}:{m.group(1):0>2}",
-        r'0 (\d+) \* \* 6': lambda m: f"каждую субботу в {m.group(1):0>2}:00",
-        r'(\d+) (\d+) \* \* 6': lambda m: f"каждую субботу в {m.group(2):0>2}:{m.group(1):0>2}",
-        r'0 (\d+) \* \* 0': lambda m: f"каждое воскресенье в {m.group(1):0>2}:00",
-        r'(\d+) (\d+) \* \* 0': lambda m: f"каждое воскресенье в {m.group(2):0>2}:{m.group(1):0>2}",
         
         # Ежемесячные с последним днем месяца (L)
         r'0 (\d+) L \* \*': lambda m: f"в последний день каждого месяца в {m.group(1):0>2}:00",
@@ -109,15 +102,11 @@ def parse_cron_description(cron_expression):
         r'0 (\d+) (\d+) (\d+) \*': lambda m: get_yearly_description(m.group(1), m.group(2), m.group(3)),
         r'(\d+) (\d+) (\d+) (\d+) \*': lambda m: get_yearly_description(m.group(2), m.group(3), m.group(4), m.group(1)),
         
-        # Рабочие дни (понедельник-пятница)
+        # Рабочие дни и выходные
         r'0 (\d+) \* \* 1-5': lambda m: f"по будням в {m.group(1):0>2}:00",
         r'(\d+) (\d+) \* \* 1-5': lambda m: f"по будням в {m.group(2):0>2}:{m.group(1):0>2}",
-        
-        # Выходные (суббота-воскресенье)
-        r'0 (\d+) \* \* 0,6': lambda m: f"по выходным в {m.group(1):0>2}:00",
-        r'(\d+) (\d+) \* \* 0,6': lambda m: f"по выходным в {m.group(2):0>2}:{m.group(1):0>2}",
-        r'0 (\d+) \* \* 6,0': lambda m: f"по выходным в {m.group(1):0>2}:00",
-        r'(\d+) (\d+) \* \* 6,0': lambda m: f"по выходным в {m.group(2):0>2}:{m.group(1):0>2}",
+        r'0 (\d+) \* \* (?:0,6|6,0)': lambda m: f"по выходным в {m.group(1):0>2}:00",
+        r'(\d+) (\d+) \* \* (?:0,6|6,0)': lambda m: f"по выходным в {m.group(2):0>2}:{m.group(1):0>2}",
         
         # Каждый час и минуты
         r'0 \* \* \* \*': lambda m: "каждый час",
@@ -133,6 +122,11 @@ def parse_cron_description(cron_expression):
         r'15 (\d+) \* \* \*': lambda m: f"каждый день в {m.group(1):0>2}:15",
         r'45 (\d+) \* \* \*': lambda m: f"каждый день в {m.group(1):0>2}:45",
     }
+    
+    # Добавляем паттерны для дней недели динамически
+    for day_num, (day_name, _) in weekdays.items():
+        cron_patterns[f'0 (\\d+) \\* \\* {day_num}'] = lambda m, d=day_name: f"каждый{'у' if d in ['среду', 'пятницу', 'субботу'] else 'е' if d == 'воскресенье' else ''} {d} в {m.group(1):0>2}:00"
+        cron_patterns[f'(\\d+) (\\d+) \\* \\* {day_num}'] = lambda m, d=day_name: f"каждый{'у' if d in ['среду', 'пятницу', 'субботу'] else 'е' if d == 'воскресенье' else ''} {d} в {m.group(2):0>2}:{m.group(1):0>2}"
     
     import re
     
@@ -152,51 +146,35 @@ def format_reminders_text_and_keyboard(reminders):
     for i, reminder in enumerate(reminders, 1):
         status = "🟢" if reminder['is_active'] else "🔴"
         built_in = " (встроенное)" if reminder['is_built_in'] else ""
-        
-        # Показываем полный текст напоминания
         full_text = reminder['text']
         
         if reminder['reminder_type'] == 'once':
             time_info = reminder['trigger_time'].strftime("%d.%m.%Y %H:%M")
-            text += f"{status} {i}. {full_text}\n"
-            text += f"   📅 Разовое: {time_info}{built_in}\n\n"
-        else:
-            # Для повторяющихся напоминаний показываем частоту
-            frequency_description = parse_cron_description(reminder['cron_expression'])
-            text += f"{status} {i}. {full_text}\n"
-            text += f"   🔄 {frequency_description}{built_in}\n\n"
-        
-        # Добавляем кнопки для управления напоминанием
-        if reminder['reminder_type'] == 'recurring':
-            # Для повторяющихся напоминаний: кнопки удалить и отключить/включить в одной строке
-            if reminder['is_active']:
-                keyboard_buttons.append([
-                    types.InlineKeyboardButton(
-                        text=f"🗑 Удалить #{i}", 
-                        callback_data=f"delete_reminder_{reminder['reminder_id']}"
-                    ),
-                    types.InlineKeyboardButton(
-                        text=f"🔴 Отключить #{i}", 
-                        callback_data=f"disable_reminder_{reminder['reminder_id']}"
-                    )
-                ])
-            else:
-                keyboard_buttons.append([
-                    types.InlineKeyboardButton(
-                        text=f"🗑 Удалить #{i}", 
-                        callback_data=f"delete_reminder_{reminder['reminder_id']}"
-                    ),
-                    types.InlineKeyboardButton(
-                        text=f"🟢 Включить #{i}", 
-                        callback_data=f"enable_reminder_{reminder['reminder_id']}"
-                    )
-                ])
-        else:
-            # Для разовых напоминаний: только кнопка удаления в отдельной строке
+            text += f"{status} {i}. {full_text}\n   📅 Разовое: {time_info}{built_in}\n\n"
+            # Для разовых напоминаний: только кнопка удаления
             keyboard_buttons.append([
                 types.InlineKeyboardButton(
                     text=f"🗑 Удалить #{i}", 
                     callback_data=f"delete_reminder_{reminder['reminder_id']}"
+                )
+            ])
+        else:
+            # Для повторяющихся напоминаний показываем частоту
+            frequency_description = parse_cron_description(reminder['cron_expression'])
+            text += f"{status} {i}. {full_text}\n   🔄 {frequency_description}{built_in}\n\n"
+            
+            # Кнопки удалить и отключить/включить в одной строке
+            action_text = "🔴 Отключить" if reminder['is_active'] else "🟢 Включить"
+            action_callback = f"{'disable' if reminder['is_active'] else 'enable'}_reminder_{reminder['reminder_id']}"
+            
+            keyboard_buttons.append([
+                types.InlineKeyboardButton(
+                    text=f"🗑 Удалить #{i}", 
+                    callback_data=f"delete_reminder_{reminder['reminder_id']}"
+                ),
+                types.InlineKeyboardButton(
+                    text=f"{action_text} #{i}", 
+                    callback_data=action_callback
                 )
             ])
     
@@ -204,15 +182,11 @@ def format_reminders_text_and_keyboard(reminders):
 
 async def update_reminders_list_message(message: types.Message, user_id: int):
     """Обновляет сообщение со списком напоминаний"""
-    # Используем метод из database/connection.py, который автоматически расшифровывает данные
     reminders = await db.get_user_reminders(user_id)
     
     if not reminders:
         try:
-            await message.edit_text(
-                "📋 У вас пока нет напоминаний",
-                reply_markup=None
-            )
+            await message.edit_text("📋 У вас пока нет напоминаний", reply_markup=None)
         except Exception as e:
             print(f"Error editing message: {e}")
         return
@@ -220,7 +194,6 @@ async def update_reminders_list_message(message: types.Message, user_id: int):
     text, keyboard_buttons = format_reminders_text_and_keyboard(reminders)
     
     # Telegram имеет лимит на длину сообщения (4096 символов)
-    # Если сообщение слишком длинное, используем только первые 4000 символов
     if len(text) > 4000:
         text = text[:3900] + "\n\n... (список слишком большой)"
     
@@ -230,7 +203,6 @@ async def update_reminders_list_message(message: types.Message, user_id: int):
         await message.edit_text(text, reply_markup=keyboard)
     except Exception as e:
         print(f"Error editing message: {e}")
-        # Если редактирование не удалось, отправляем новое сообщение
         try:
             await message.answer(text, reply_markup=keyboard)
         except Exception as e2:
@@ -238,7 +210,6 @@ async def update_reminders_list_message(message: types.Message, user_id: int):
 
 async def send_reminders_list(message: types.Message, user_id: int):
     """Отправляет список напоминаний с обработкой длинных сообщений"""
-    # Используем метод из database/connection.py, который автоматически расшифровывает данные
     reminders = await db.get_user_reminders(user_id)
     
     if not reminders:
@@ -251,7 +222,6 @@ async def send_reminders_list(message: types.Message, user_id: int):
     text, keyboard_buttons = format_reminders_text_and_keyboard(reminders)
     
     # Telegram имеет лимит на длину сообщения (4096 символов)
-    # Если сообщение слишком длинное, разбиваем его на части
     if len(text) > 4000:
         # Отправляем по частям
         messages = []
@@ -279,42 +249,38 @@ async def send_reminders_list(message: types.Message, user_id: int):
         keyboard = types.InlineKeyboardMarkup(inline_keyboard=keyboard_buttons) if keyboard_buttons else None
         await message.answer(text, reply_markup=keyboard)
 
-@router.message(lambda message: message.text == "➕ Разовое напоминание")
-async def create_once_reminder(message: types.Message, state: FSMContext):
-    """Создание разового напоминания"""
-    # Очищаем предыдущее состояние перед началом нового процесса
+async def create_reminder_handler(message: types.Message, state: FSMContext, reminder_type: str):
+    """Общий обработчик создания напоминаний"""
     await state.clear()
     
+    type_text = "разового" if reminder_type == "once" else "повторяющегося"
+    emoji = "📝" if reminder_type == "once" else "🔄"
+    
     await message.answer(
-        "📝 Создание разового напоминания\n\n"
+        f"{emoji} Создание {type_text} напоминания\n\n"
         "Введите текст напоминания:",
         reply_markup=get_back_to_main_keyboard()
     )
     
     await state.set_state(ReminderStates.waiting_for_text)
-    await state.update_data(reminder_type="once")
+    await state.update_data(reminder_type=reminder_type)
+
+@router.message(lambda message: message.text == "➕ Разовое напоминание")
+async def create_once_reminder(message: types.Message, state: FSMContext):
+    """Создание разового напоминания"""
+    await state.clear()
+    await create_reminder_handler(message, state, "once")
 
 @router.message(lambda message: message.text == "🔄 Повторяющееся напоминание")
 async def create_recurring_reminder(message: types.Message, state: FSMContext):
     """Создание повторяющегося напоминания"""
-    # Очищаем предыдущее состояние перед началом нового процесса
     await state.clear()
-    
-    await message.answer(
-        "🔄 Создание повторяющегося напоминания\n\n"
-        "Введите текст напоминания:",
-        reply_markup=get_back_to_main_keyboard()
-    )
-    
-    await state.set_state(ReminderStates.waiting_for_text)
-    await state.update_data(reminder_type="recurring")
+    await create_reminder_handler(message, state, "recurring")
 
 @router.message(lambda message: message.text == "📋 Список напоминаний")
 async def list_reminders(message: types.Message, state: FSMContext):
     """Просмотр списка напоминаний"""
-    # Очищаем любое активное состояние при переходе к списку напоминаний
     await state.clear()
-    
     user_id = message.from_user.id
     await send_reminders_list(message, user_id)
         
@@ -333,27 +299,27 @@ async def process_reminder_text(message: types.Message, state: FSMContext):
     
     type_text = "разового" if reminder_type == "once" else "повторяющегося"
     
-    if reminder_type == "once":
-        examples = (
+    examples = {
+        "once": (
             "Примеры:\n"
             "• 'завтра в 15:00'\n"
             "• 'через 2 часа'\n"
             "• 'сегодня в 20:30'\n"
             "• 'в пятницу в 14:00'"
-        )
-    else:
-        examples = (
+        ),
+        "recurring": (
             "Примеры:\n"
             "• 'каждый день в 9 утра'\n"
             "• 'каждый понедельник в 10:00'\n"
             "• 'каждую пятницу в 18:00'\n"
             "• 'каждые 30 минут'"
         )
+    }
     
     await message.answer(
         f"✅ Текст {type_text} напоминания: {reminder_text}\n\n"
         f"Теперь укажите, когда вы хотите получить это напоминание.\n"
-        f"{examples}",
+        f"{examples[reminder_type]}",
         reply_markup=get_back_to_main_keyboard()
     )
     
@@ -647,3 +613,20 @@ async def handle_reminder_action(callback: types.CallbackQuery, state: FSMContex
             await callback.answer("Напоминание включено")
         else:
             await callback.answer("Ошибка при включении напоминания")
+
+    # Обновляем список напоминаний
+    await update_reminders_list_message(callback.message, user_id)
+
+# Регистрируем обработчики для действий с напоминаниями
+@router.callback_query(lambda c: c.data.startswith("delete_reminder_"))
+async def delete_reminder(callback: types.CallbackQuery, state: FSMContext):
+    await handle_reminder_action(callback, state, "delete")
+
+@router.callback_query(lambda c: c.data.startswith("disable_reminder_"))
+async def disable_reminder(callback: types.CallbackQuery, state: FSMContext):
+    await handle_reminder_action(callback, state, "disable")
+
+@router.callback_query(lambda c: c.data.startswith("enable_reminder_"))
+async def enable_reminder(callback: types.CallbackQuery, state: FSMContext):
+    await handle_reminder_action(callback, state, "enable")
+

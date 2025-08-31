@@ -1,4 +1,4 @@
-from aiogram import Router, types, Bot
+from aiogram import Router, types
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from datetime import datetime, timedelta
@@ -61,11 +61,82 @@ def create_deadline_from_user_time(user_timezone_str, year, month, day, hour=23,
         logger.error(f"Error creating deadline: {e}")
         return None
 
+def calculate_deadline(action, user_timezone, current_time):
+    """Вычисляет дедлайн на основе действия"""
+    if action == "today":
+        return create_deadline_from_user_time(
+            user_timezone, 
+            current_time.year, current_time.month, current_time.day
+        )
+    elif action == "week":
+        days_until_sunday = 6 - current_time.weekday()
+        target_date = current_time + timedelta(days=days_until_sunday)
+        return create_deadline_from_user_time(
+            user_timezone,
+            target_date.year, target_date.month, target_date.day
+        )
+    elif action == "month":
+        next_month = current_time.replace(day=28) + timedelta(days=4)
+        last_day_of_month = next_month - timedelta(days=next_month.day)
+        return create_deadline_from_user_time(
+            user_timezone,
+            last_day_of_month.year, last_day_of_month.month, last_day_of_month.day
+        )
+    elif action == "year":
+        return create_deadline_from_user_time(
+            user_timezone,
+            current_time.year, 12, 31
+        )
+    elif action == "none":
+        return None
+    return None
+
+def get_state_error_response(message_or_callback, is_callback=False):
+    """Универсальная обработка ошибки отсутствия состояния"""
+    error_msg = "❌ Ошибка: текст задачи потерян. Начните сначала."
+    restart_msg = "Произошла ошибка. Пожалуйста, создайте задачу заново."
+    keyboard = get_tasks_menu_keyboard()
+    
+    if is_callback:
+        return error_msg, restart_msg, keyboard
+    else:
+        return "❌ Ошибка: текст задачи потерян. Начните создание задачи заново.", keyboard
+
+async def validate_task_state(state: FSMContext, message_or_callback, is_callback=False):
+    """Валидация состояния задачи"""
+    data = await state.get_data()
+    if not data.get("task_text"):
+        logger.error("Task text is missing from state!")
+        if is_callback:
+            error_msg, restart_msg, keyboard = get_state_error_response(message_or_callback, True)
+            await message_or_callback.answer(error_msg)
+            await message_or_callback.message.answer(restart_msg, reply_markup=keyboard)
+        else:
+            error_msg, keyboard = get_state_error_response(message_or_callback, False)
+            await message_or_callback.answer(error_msg, reply_markup=keyboard)
+        await state.clear()
+        return False
+    return True
+
+async def send_message_with_fallback(message_or_callback, text, reply_markup=None, is_callback=False):
+    """Отправка сообщения с fallback для callback"""
+    if is_callback and hasattr(message_or_callback, 'message') and hasattr(message_or_callback.message, 'edit_text'):
+        try:
+            await message_or_callback.message.edit_text(text, reply_markup=reply_markup)
+        except:
+            await message_or_callback.message.answer(text, reply_markup=reply_markup)
+    else:
+        target = message_or_callback.message if is_callback else message_or_callback
+        await target.answer(text, reply_markup=reply_markup)
+
 # ======= СОЗДАНИЕ ЗАДАЧ =======
 
 @router.message(lambda message: message.text == "➕ Создать новую задачу")
 async def create_task_start(message: types.Message, state: FSMContext):
     """Начало создания новой задачи"""
+    # Очищаем состояние перед началом нового процесса
+    await state.clear()
+    
     # Проверяем лимит активных задач
     user_id = message.from_user.id
     
@@ -142,17 +213,7 @@ async def process_category_selection(callback: types.CallbackQuery, state: FSMCo
     action = callback.data.replace("category_", "")
     
     # Проверяем состояние перед обработкой категории
-    data = await state.get_data()
-    logger.debug(f"State data before category selection: task_text exists = {bool(data.get('task_text'))}")
-    
-    if not data.get("task_text"):
-        logger.error("Task text is missing from state!")
-        await callback.answer("❌ Ошибка: текст задачи потерян. Начните сначала.")
-        await callback.message.answer(
-            "Произошла ошибка. Пожалуйста, создайте задачу заново.",
-            reply_markup=get_tasks_menu_keyboard()
-        )
-        await state.clear()
+    if not await validate_task_state(state, callback, True):
         return
     
     if action == "new":
@@ -194,14 +255,7 @@ async def process_custom_category(message: types.Message, state: FSMContext):
         return
     
     # Проверяем состояние
-    data = await state.get_data()
-    if not data.get("task_text"):
-        logger.error("Task text is missing from state during custom category!")
-        await message.answer(
-            "❌ Ошибка: текст задачи потерян. Начните создание задачи заново.",
-            reply_markup=get_tasks_menu_keyboard()
-        )
-        await state.clear()
+    if not await validate_task_state(state, message, False):
         return
     
     category = message.text.strip()
@@ -227,34 +281,13 @@ async def show_deadline_selection(callback, state, category):
     keyboard = get_deadline_selection_keyboard()
     
     category_text = f"Категория: {category}" if category else "Без категории"
+    text = f"✅ {category_text}\n\nВыберите дедлайн:"
     
-    if hasattr(callback, 'message') and hasattr(callback.message, 'edit_text'):
-        try:
-            await callback.message.edit_text(
-                f"✅ {category_text}\n\n"
-                "Выберите дедлайн:",
-                reply_markup=keyboard
-            )
-        except:
-            # Если редактирование не удалось, отправляем новое сообщение
-            await callback.message.answer(
-                f"✅ {category_text}\n\n"
-                "Выберите дедлайн:",
-                reply_markup=keyboard
-            )
-    else:
-        # Для обычного сообщения
-        await callback.message.answer(
-            f"✅ {category_text}\n\n"
-            "Выберите дедлайн:",
-            reply_markup=keyboard
-        )
-    
+    await send_message_with_fallback(callback, text, keyboard, hasattr(callback, 'id'))
     await state.set_state(TaskStates.waiting_for_deadline)
 
-@router.callback_query(lambda c: c.data.startswith("deadline_") and c.message.text.startswith("⏰ Выберите новый дедлайн"))
-async def process_extend_deadline_callback(callback: types.CallbackQuery, state: FSMContext):
-    """Обработка выбора дедлайна при продлении задачи"""
+async def process_deadline_common(callback: types.CallbackQuery, state: FSMContext, is_extend=False):
+    """Общая логика обработки дедлайна"""
     action = callback.data.replace("deadline_", "")
     user_id = callback.from_user.id
     
@@ -263,49 +296,30 @@ async def process_extend_deadline_callback(callback: types.CallbackQuery, state:
         user = await conn.fetchrow("SELECT timezone FROM users WHERE user_id = $1", user_id)
     
     current_time = get_user_time(user['timezone'])
-    new_deadline = None
     
     try:
-        if action == "today":
-            new_deadline = create_deadline_from_user_time(
-                user['timezone'], 
-                current_time.year, current_time.month, current_time.day
-            )
-        elif action == "week":
-            days_until_sunday = 6 - current_time.weekday()
-            target_date = current_time + timedelta(days=days_until_sunday)
-            new_deadline = create_deadline_from_user_time(
-                user['timezone'],
-                target_date.year, target_date.month, target_date.day
-            )
-        elif action == "month":
-            next_month = current_time.replace(day=28) + timedelta(days=4)
-            last_day_of_month = next_month - timedelta(days=next_month.day)
-            new_deadline = create_deadline_from_user_time(
-                user['timezone'],
-                last_day_of_month.year, last_day_of_month.month, last_day_of_month.day
-            )
-        elif action == "year":
-            new_deadline = create_deadline_from_user_time(
-                user['timezone'],
-                current_time.year, 12, 31
-            )
-        elif action == "custom":
-            await callback.message.edit_text(
-                "📅 Введите новый дедлайн в формате ДД.ММ.ГГГГ\n"
-                "Например: 15.12.2024"
-            )
-            await state.set_state(TaskStates.waiting_for_extend_deadline)
+        if action == "custom":
+            prompt = "📅 Введите новый дедлайн в формате ДД.ММ.ГГГГ\nНапример: 15.12.2024" if is_extend else "📅 Введите дедлайн в формате ДД.ММ.ГГГГ\nНапример: 15.12.2024"
+            await callback.message.edit_text(prompt)
+            next_state = TaskStates.waiting_for_extend_deadline if is_extend else TaskStates.waiting_for_custom_deadline
+            await state.set_state(next_state)
             return
-        elif action == "none":
-            new_deadline = None
+        
+        deadline = calculate_deadline(action, user['timezone'], current_time)
+        
+        if is_extend:
+            await complete_extend_task(callback, state, deadline)
+        else:
+            await save_task(callback, state, deadline)
+            
     except Exception as e:
-        logger.error(f"Error creating extend deadline: {e}")
+        logger.error(f"Error creating deadline: {e}")
         await callback.answer("❌ Ошибка при создании дедлайна")
-        return
-    
-    # Обновляем задачу и возвращаемся к списку
-    await complete_extend_task(callback, state, new_deadline)
+
+@router.callback_query(lambda c: c.data.startswith("deadline_") and c.message.text.startswith("⏰ Выберите новый дедлайн"))
+async def process_extend_deadline_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Обработка выбора дедлайна при продлении задачи"""
+    await process_deadline_common(callback, state, is_extend=True)
 
 @router.callback_query(lambda c: c.data.startswith("deadline_"))
 async def process_deadline_selection(callback: types.CallbackQuery, state: FSMContext):
@@ -315,90 +329,19 @@ async def process_deadline_selection(callback: types.CallbackQuery, state: FSMCo
         return  # Обработка в process_extend_deadline_callback
     
     # Проверяем состояние перед обработкой дедлайна
-    data = await state.get_data()
-    logger.debug(f"State data before deadline selection: task_text exists = {bool(data.get('task_text'))}")
-    
-    if not data.get("task_text"):
-        logger.error("Task text is missing from state during deadline selection!")
-        await callback.answer("❌ Ошибка: текст задачи потерян. Начните сначала.")
-        await callback.message.answer(
-            "Произошла ошибка. Пожалуйста, создайте задачу заново.",
-            reply_markup=get_tasks_menu_keyboard()
-        )
-        await state.clear()
+    if not await validate_task_state(state, callback, True):
         return
     
-    action = callback.data.replace("deadline_", "")
-    user_id = callback.from_user.id
-    
-    # Получаем часовой пояс пользователя
-    async with db.pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT timezone FROM users WHERE user_id = $1", user_id)
-    
-    user_timezone = user['timezone']
-    current_time = get_user_time(user_timezone)
-    deadline = None
-    
-    try:
-        if action == "today":
-            deadline = create_deadline_from_user_time(
-                user_timezone, 
-                current_time.year, current_time.month, current_time.day
-            )
-        elif action == "week":
-            # До воскресенья текущей недели
-            days_until_sunday = 6 - current_time.weekday()
-            target_date = current_time + timedelta(days=days_until_sunday)
-            deadline = create_deadline_from_user_time(
-                user_timezone,
-                target_date.year, target_date.month, target_date.day
-            )
-        elif action == "month":
-            # До конца текущего месяца
-            next_month = current_time.replace(day=28) + timedelta(days=4)
-            last_day_of_month = next_month - timedelta(days=next_month.day)
-            deadline = create_deadline_from_user_time(
-                user_timezone,
-                last_day_of_month.year, last_day_of_month.month, last_day_of_month.day
-            )
-        elif action == "year":
-            # До конца текущего года
-            deadline = create_deadline_from_user_time(
-                user_timezone,
-                current_time.year, 12, 31
-            )
-        elif action == "custom":
-            await callback.message.edit_text(
-                "📅 Введите дедлайн в формате ДД.ММ.ГГГГ\n"
-                "Например: 15.12.2024"
-            )
-            await state.set_state(TaskStates.waiting_for_custom_deadline)
-            return
-        elif action == "none":
-            deadline = None
-    except Exception as e:
-        logger.error(f"Error creating deadline: {e}")
-        await callback.answer("❌ Ошибка при создании дедлайна")
-        return
-    
-    await save_task(callback, state, deadline)
+    await process_deadline_common(callback, state, is_extend=False)
 
-@router.message(TaskStates.waiting_for_custom_deadline)
-async def process_custom_deadline(message: types.Message, state: FSMContext):
-    """Обработка ввода произвольного дедлайна"""
+async def process_custom_deadline_common(message: types.Message, state: FSMContext, is_extend=False):
+    """Общая логика для обработки произвольного дедлайна"""
     if message.text == "🏠 Главное меню":
         await state.clear()
         return
     
-    # Проверяем состояние
-    data = await state.get_data()
-    if not data.get("task_text"):
-        logger.error("Task text is missing from state during custom deadline!")
-        await message.answer(
-            "❌ Ошибка: текст задачи потерян. Начните создание задачи заново.",
-            reply_markup=get_tasks_menu_keyboard()
-        )
-        await state.clear()
+    # Проверяем состояние только для создания задач, не для продления
+    if not is_extend and not await validate_task_state(state, message, False):
         return
     
     try:
@@ -439,7 +382,10 @@ async def process_custom_deadline(message: types.Message, state: FSMContext):
             message=message, data="fake"
         )
         
-        await save_task(fake_callback, state, deadline)
+        if is_extend:
+            await complete_extend_task(fake_callback, state, deadline)
+        else:
+            await save_task(fake_callback, state, deadline)
         
     except (ValueError, IndexError) as e:
         logger.error(f"Error parsing custom deadline: {e}")
@@ -449,6 +395,16 @@ async def process_custom_deadline(message: types.Message, state: FSMContext):
             "Например: 15.12.2024\n\n"
             "Попробуйте еще раз:"
         )
+
+@router.message(TaskStates.waiting_for_custom_deadline)
+async def process_custom_deadline(message: types.Message, state: FSMContext):
+    """Обработка ввода произвольного дедлайна"""
+    await process_custom_deadline_common(message, state, is_extend=False)
+
+@router.message(TaskStates.waiting_for_extend_deadline)
+async def process_extend_custom_deadline_input(message: types.Message, state: FSMContext):
+    """Обработка ввода произвольного дедлайна при продлении"""
+    await process_custom_deadline_common(message, state, is_extend=True)
 
 async def save_task(callback, state, deadline):
     """Сохранение задачи в базу данных"""
@@ -507,13 +463,7 @@ async def save_task(callback, state, deadline):
             f"📅 Дедлайн: {deadline_text}"
         )
         
-        if hasattr(callback, 'message') and hasattr(callback.message, 'edit_text'):
-            try:
-                await callback.message.edit_text(success_message)
-            except:
-                await callback.message.answer(success_message)
-        else:
-            await callback.message.answer(success_message)
+        await send_message_with_fallback(callback, success_message, is_callback=hasattr(callback, 'id') and callback.id != "fake")
         
         await callback.message.answer(
             "Что дальше?",
@@ -603,31 +553,35 @@ def format_tasks_message(tasks_data, title, user_timezone=None):
         current_time = get_user_time(user_timezone)
         current_date = current_time.date()
     
+    def format_task_line(task, counter):
+        """Форматирует строку задачи"""
+        deadline_text = ""
+        task_prefix = ""
+        
+        if task.get('deadline'):
+            # Конвертируем deadline в пользовательский часовой пояс
+            if user_timezone:
+                deadline_display = pytz.UTC.localize(task['deadline']).astimezone(pytz.timezone(user_timezone))
+                deadline_date = deadline_display.date()
+                
+                # Выделяем задачи на сегодня
+                if current_date and deadline_date == current_date:
+                    task_prefix = "🚨 "
+                
+                deadline_text = f" (📅 {deadline_display.strftime('%d.%m.%Y')})"
+            else:
+                deadline_text = f" (📅 {task['deadline'].strftime('%d.%m.%Y')})"
+        elif task.get('completed_at'):
+            deadline_text = f" (📅 {task['completed_at'].strftime('%d.%m.%Y')})"
+        
+        return f"{counter}. {task_prefix}{task['text']}{deadline_text}"
+    
     # Задачи по категориям
     for category_name, category_tasks in categorized_tasks.items():
         message_parts.append(f"📂 {category_name}")
         
         for task in category_tasks:
-            deadline_text = ""
-            task_prefix = ""
-            
-            if task.get('deadline'):
-                # Конвертируем deadline в пользовательский часовой пояс
-                if user_timezone:
-                    deadline_display = pytz.UTC.localize(task['deadline']).astimezone(pytz.timezone(user_timezone))
-                    deadline_date = deadline_display.date()
-                    
-                    # Выделяем задачи на сегодня
-                    if current_date and deadline_date == current_date:
-                        task_prefix = "🚨 "
-                    
-                    deadline_text = f" (📅 {deadline_display.strftime('%d.%m.%Y')})"
-                else:
-                    deadline_text = f" (📅 {task['deadline'].strftime('%d.%m.%Y')})"
-            elif task.get('completed_at'):
-                deadline_text = f" (📅 {task['completed_at'].strftime('%d.%m.%Y')})"
-            
-            task_text = f"{task_counter}. {task_prefix}{task['text']}{deadline_text}"
+            task_text = format_task_line(task, task_counter)
             message_parts.append(task_text)
             task_counter += 1
         
@@ -638,26 +592,7 @@ def format_tasks_message(tasks_data, title, user_timezone=None):
         message_parts.append("📂 Без категории")
         
         for task in uncategorized_tasks:
-            deadline_text = ""
-            task_prefix = ""
-            
-            if task.get('deadline'):
-                # Конвертируем deadline в пользовательский часовой пояс
-                if user_timezone:
-                    deadline_display = pytz.UTC.localize(task['deadline']).astimezone(pytz.timezone(user_timezone))
-                    deadline_date = deadline_display.date()
-                    
-                    # Выделяем задачи на сегодня
-                    if current_date and deadline_date == current_date:
-                        task_prefix = "🚨 "
-                    
-                    deadline_text = f" (📅 {deadline_display.strftime('%d.%m.%Y')})"
-                else:
-                    deadline_text = f" (📅 {task['deadline'].strftime('%d.%m.%Y')})"
-            elif task.get('completed_at'):
-                deadline_text = f" (📅 {task['completed_at'].strftime('%d.%m.%Y')})"
-            
-            task_text = f"{task_counter}. {task_prefix}{task['text']}{deadline_text}"
+            task_text = format_task_line(task, task_counter)
             message_parts.append(task_text)
             task_counter += 1
     
@@ -747,8 +682,11 @@ async def update_overdue_tasks_for_user(user_id: int):
 # ======= ПРОСМОТР ЗАДАЧ =======
 
 @router.message(lambda message: message.text == "👀 Просмотр задач")
-async def view_tasks_menu(message: types.Message):
+async def view_tasks_menu(message: types.Message, state: FSMContext):
     """Меню просмотра задач с автообновлением статусов"""
+    # Очищаем состояние перед просмотром
+    await state.clear()
+    
     # Сначала обновляем просроченные задачи
     await update_overdue_tasks_for_user(message.from_user.id)
     
@@ -758,95 +696,67 @@ async def view_tasks_menu(message: types.Message):
         reply_markup=get_task_view_menu_keyboard()
     )
 
-@router.message(lambda message: message.text == "🔥 Активные")
-async def view_active_tasks(message: types.Message):
-    """Просмотр активных задач"""
-    # Обновляем статусы перед показом
-    await update_overdue_tasks_for_user(message.from_user.id)
-    await send_tasks_group_message(message, 'active', "🔥 Активные задачи")
+# Обработчики просмотра задач
+TASK_VIEW_HANDLERS = {
+    "🔥 Активные": ("active", "🔥 Активные задачи"),
+    "✅ Выполненные": ("completed", "✅ Выполненные задачи"),
+    "❌ Невыполненные": ("failed", "❌ Невыполненные задачи"),
+    "⚠️ Просроченные": ("overdue", "⚠️ Просроченные задачи")
+}
 
-@router.message(lambda message: message.text == "✅ Выполненные")
-async def view_completed_tasks(message: types.Message):
-    """Просмотр выполненных задач"""
-    await send_tasks_group_message(message, 'completed', "✅ Выполненные задачи")
+async def handle_task_view(message: types.Message, status: str, title: str, update_overdue: bool = False):
+    """Универсальный обработчик просмотра задач"""
+    if update_overdue:
+        await update_overdue_tasks_for_user(message.from_user.id)
+    await send_tasks_group_message(message, status, title)
 
-@router.message(lambda message: message.text == "❌ Невыполненные")
-async def view_failed_tasks(message: types.Message):
-    """Просмотр невыполненных задач"""
-    await send_tasks_group_message(message, 'failed', "❌ Невыполненные задачи")
-
-@router.message(lambda message: message.text == "⚠️ Просроченные")
-async def view_overdue_tasks(message: types.Message):
-    """Просмотр просроченных задач"""
-    # Обновляем статусы перед показом
-    await update_overdue_tasks_for_user(message.from_user.id)
-    await send_tasks_group_message(message, 'overdue', "⚠️ Просроченные задачи")
+@router.message(lambda message: message.text in TASK_VIEW_HANDLERS)
+async def view_tasks_handler(message: types.Message):
+    """Универсальный обработчик для всех типов просмотра задач"""
+    status, title = TASK_VIEW_HANDLERS[message.text]
+    update_overdue = status in ['active', 'overdue']
+    await handle_task_view(message, status, title, update_overdue)
 
 # ======= ОБРАБОТЧИКИ ГРУППОВЫХ ДЕЙСТВИЙ =======
 
-@router.callback_query(lambda c: c.data.startswith("group_complete_"))
-async def group_complete_task(callback: types.CallbackQuery):
-    """Отметить задачу как выполненную в групповом режиме"""
+async def handle_group_action(callback: types.CallbackQuery, action: str):
+    """Универсальный обработчик групповых действий с задачами"""
     parts = callback.data.split("_")
     task_id = int(parts[2])
     current_status = parts[3]
     user_id = callback.from_user.id
     
-    # Используем методы из db для обновления статуса
-    success = await db.update_task_status(task_id, user_id, 'completed')
+    success = False
+    message = ""
     
-    if success:
-        # Проверяем лимит выполненных задач и принудительно применяем его
-        await enforce_task_limits(user_id, 'completed')
-        await callback.answer("✅ Задача отмечена как выполненная!")
-    else:
+    if action == "complete":
+        success = await db.update_task_status(task_id, user_id, 'completed')
+        if success:
+            await enforce_task_limits(user_id, 'completed')
+            message = "✅ Задача отмечена как выполненная!"
+    elif action == "fail":
+        success = await db.update_task_status(task_id, user_id, 'failed')
+        if success:
+            await enforce_task_limits(user_id, 'failed')
+            message = "❌ Задача отмечена как невыполненная"
+    elif action == "delete":
+        success = await db.delete_task(task_id, user_id)
+        message = "🗑 Задача удалена" if success else "❌ Ошибка при удалении задачи"
+    
+    if not success and action != "delete":
         await callback.answer("❌ Ошибка при обновлении задачи")
         return
+    
+    await callback.answer(message)
     
     # Обновляем сообщение со списком задач
     await refresh_tasks_message(callback, current_status, user_id)
 
-@router.callback_query(lambda c: c.data.startswith("group_fail_"))
-async def group_fail_task(callback: types.CallbackQuery):
-    """Отметить задачу как невыполненную в групповом режиме"""
-    parts = callback.data.split("_")
-    task_id = int(parts[2])
-    current_status = parts[3]
-    user_id = callback.from_user.id
-    
-    # Используем методы из db для обновления статуса
-    success = await db.update_task_status(task_id, user_id, 'failed')
-    
-    if success:
-        # Проверяем лимит невыполненных задач и принудительно применяем его
-        await enforce_task_limits(user_id, 'failed')
-        await callback.answer("❌ Задача отмечена как невыполненная")
-    else:
-        await callback.answer("❌ Ошибка при обновлении задачи")
-        return
-    
-    # Обновляем сообщение со списком задач
-    await refresh_tasks_message(callback, current_status, user_id)
-
-@router.callback_query(lambda c: c.data.startswith("group_delete_"))
-async def group_delete_task(callback: types.CallbackQuery):
-    """Удалить задачу в групповом режиме"""
-    parts = callback.data.split("_")
-    task_id = int(parts[2])
-    current_status = parts[3]
-    user_id = callback.from_user.id
-    
-    # Используем методы из db для удаления
-    success = await db.delete_task(task_id, user_id)
-    
-    if success:
-        await callback.answer("🗑 Задача удалена")
-    else:
-        await callback.answer("❌ Ошибка при удалении задачи")
-        return
-    
-    # Обновляем сообщение со списком задач
-    await refresh_tasks_message(callback, current_status, user_id)
+@router.callback_query(lambda c: c.data.startswith(("group_complete_", "group_fail_", "group_delete_")))
+async def group_action_handler(callback: types.CallbackQuery):
+    """Универсальный обработчик для complete, fail, delete"""
+    action = callback.data.split("_")[1]  # complete, fail, или delete
+    await handle_group_action(callback, action)
 
 @router.callback_query(lambda c: c.data.startswith("group_extend_"))
 async def group_extend_task(callback: types.CallbackQuery, state: FSMContext):
@@ -910,59 +820,6 @@ async def refresh_tasks_message(callback: types.CallbackQuery, status: str, user
 
 # ======= ОБРАБОТКА РАСШИРЕНИЯ ДЕДЛАЙНА =======
 
-@router.message(TaskStates.waiting_for_extend_deadline)
-async def process_extend_custom_deadline_input(message: types.Message, state: FSMContext):
-    """Обработка ввода произвольного дедлайна при продлении"""
-    if message.text == "🏠 Главное меню":
-        await state.clear()
-        return
-    
-    try:
-        # Парсим дату в формате ДД.ММ.ГГГГ
-        date_parts = message.text.strip().split('.')
-        if len(date_parts) != 3:
-            raise ValueError("Неверный формат")
-        
-        day, month, year = map(int, date_parts)
-        
-        # Получаем часовой пояс пользователя
-        user_id = message.from_user.id
-        async with db.pool.acquire() as conn:
-            user = await conn.fetchrow("SELECT timezone FROM users WHERE user_id = $1", user_id)
-        
-        current_time = get_user_time(user['timezone'])
-        new_deadline = create_deadline_from_user_time(
-            user['timezone'], year, month, day
-        )
-        
-        if new_deadline is None:
-            raise ValueError("Ошибка создания дедлайна")
-        
-        # Проверяем, что дата не в прошлом
-        current_utc = normalize_datetime_for_db(current_time)
-        if new_deadline < current_utc:
-            await message.answer(
-                "❌ Нельзя устанавливать дедлайн на прошедшую дату.\n"
-                "Попробуйте еще раз:"
-            )
-            return
-        
-        # Создаем фиктивный callback для завершения процесса
-        fake_callback = types.CallbackQuery(
-            id="fake", from_user=message.from_user, chat_instance="fake", 
-            message=message, data="fake"
-        )
-        
-        await complete_extend_task(fake_callback, state, new_deadline)
-        
-    except (ValueError, IndexError):
-        await message.answer(
-            "❌ Неверный формат даты!\n"
-            "Используйте формат ДД.ММ.ГГГГ\n"
-            "Например: 15.12.2024\n\n"
-            "Попробуйте еще раз:"
-        )
-
 async def complete_extend_task(callback, state: FSMContext, new_deadline):
     """Завершает процесс продления задачи"""
     data = await state.get_data()
@@ -1000,6 +857,53 @@ async def complete_extend_task(callback, state: FSMContext, new_deadline):
 
 # ======= СИСТЕМНЫЕ ФУНКЦИИ =======
 
+async def process_overdue_tasks_for_users(users):
+    """Обработка просроченных задач для списка пользователей"""
+    for user in users:
+        user_tz = pytz.timezone(user['timezone'])
+        current_time = datetime.now(user_tz)
+        current_utc = normalize_datetime_for_db(current_time)
+        
+        async with db.pool.acquire() as conn:
+            # Проверяем активные задачи с дедлайном
+            overdue_tasks = await conn.fetch(
+                """SELECT task_id FROM tasks 
+                   WHERE user_id = $1 AND status = 'active' 
+                   AND deadline IS NOT NULL AND deadline < $2""",
+                user['user_id'], current_utc
+            )
+            
+            if overdue_tasks:
+                # Проверяем лимит просроченных задач
+                overdue_count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM tasks WHERE user_id = $1 AND status = 'overdue'",
+                    user['user_id']
+                )
+                
+                tasks_to_mark = len(overdue_tasks)
+                
+                # Если превышаем лимит, удаляем самые старые просроченные
+                if overdue_count + tasks_to_mark > TASK_LIMITS['overdue']:
+                    delete_count = (overdue_count + tasks_to_mark) - TASK_LIMITS['overdue']
+                    await conn.execute(
+                        """DELETE FROM tasks WHERE task_id IN (
+                            SELECT task_id FROM tasks 
+                            WHERE user_id = $1 AND status = 'overdue'
+                            ORDER BY marked_overdue_at ASC LIMIT $2
+                        )""",
+                        user['user_id'], delete_count
+                    )
+                
+                # Помечаем задачи как просроченные
+                task_ids = [task['task_id'] for task in overdue_tasks]
+                await conn.execute(
+                    """UPDATE tasks SET status = 'overdue', marked_overdue_at = NOW() 
+                       WHERE task_id = ANY($1::int[])""",
+                    task_ids
+                )
+                
+                logger.info(f"Marked {len(task_ids)} tasks as overdue for user {user['user_id']}")
+
 async def check_overdue_tasks():
     """Проверка и пометка просроченных задач (вызывается планировщиком в 00:30)"""
     try:
@@ -1007,49 +911,7 @@ async def check_overdue_tasks():
             # Получаем всех пользователей с их часовыми поясами
             users = await conn.fetch("SELECT user_id, timezone FROM users")
             
-            for user in users:
-                user_tz = pytz.timezone(user['timezone'])
-                current_time = datetime.now(user_tz)
-                current_utc = normalize_datetime_for_db(current_time)
-                
-                # Проверяем активные задачи с дедлайном
-                overdue_tasks = await conn.fetch(
-                    """SELECT task_id FROM tasks 
-                       WHERE user_id = $1 AND status = 'active' 
-                       AND deadline IS NOT NULL AND deadline < $2""",
-                    user['user_id'], current_utc
-                )
-                
-                if overdue_tasks:
-                    # Проверяем лимит просроченных задач
-                    overdue_count = await conn.fetchval(
-                        "SELECT COUNT(*) FROM tasks WHERE user_id = $1 AND status = 'overdue'",
-                        user['user_id']
-                    )
-                    
-                    tasks_to_mark = len(overdue_tasks)
-                    
-                    # Если превышаем лимит, удаляем самые старые просроченные
-                    if overdue_count + tasks_to_mark > TASK_LIMITS['overdue']:
-                        delete_count = (overdue_count + tasks_to_mark) - TASK_LIMITS['overdue']
-                        await conn.execute(
-                            """DELETE FROM tasks WHERE task_id IN (
-                                SELECT task_id FROM tasks 
-                                WHERE user_id = $1 AND status = 'overdue'
-                                ORDER BY marked_overdue_at ASC LIMIT $2
-                            )""",
-                            user['user_id'], delete_count
-                        )
-                    
-                    # Помечаем задачи как просроченные
-                    task_ids = [task['task_id'] for task in overdue_tasks]
-                    await conn.execute(
-                        """UPDATE tasks SET status = 'overdue', marked_overdue_at = NOW() 
-                           WHERE task_id = ANY($1::int[])""",
-                        task_ids
-                    )
-                    
-                    logger.info(f"Marked {len(task_ids)} tasks as overdue for user {user['user_id']}")
+        await process_overdue_tasks_for_users(users)
         
     except Exception as e:
         logger.error(f"Error checking overdue tasks: {e}")
@@ -1066,29 +928,27 @@ async def enforce_task_limits(user_id: int, status: str):
             if count > TASK_LIMITS[status]:
                 excess = count - TASK_LIMITS[status]
                 
+                # Определяем поле для сортировки и SQL запрос
                 if status == 'completed':
-                    # Удаляем самые старые выполненные
-                    await conn.execute(
-                        """DELETE FROM tasks WHERE task_id IN (
-                            SELECT task_id FROM tasks 
-                            WHERE user_id = $1 AND status = 'completed'
-                            ORDER BY completed_at ASC LIMIT $2
-                        )""",
-                        user_id, excess
-                    )
-                elif status in ['failed', 'overdue']:
-                    # Удаляем самые старые невыполненные/просроченные
-                    order_field = 'completed_at' if status == 'failed' else 'marked_overdue_at'
-                    await conn.execute(
-                        f"""DELETE FROM tasks WHERE task_id IN (
-                            SELECT task_id FROM tasks 
-                            WHERE user_id = $1 AND status = $2
-                            ORDER BY {order_field} ASC LIMIT $3
-                        )""",
-                        user_id, status, excess
-                    )
+                    order_field = 'completed_at'
+                elif status == 'failed':
+                    order_field = 'completed_at'
+                elif status == 'overdue':
+                    order_field = 'marked_overdue_at'
+                else:
+                    return  # Неизвестный статус
+                
+                await conn.execute(
+                    f"""DELETE FROM tasks WHERE task_id IN (
+                        SELECT task_id FROM tasks 
+                        WHERE user_id = $1 AND status = $2
+                        ORDER BY {order_field} ASC LIMIT $3
+                    )""",
+                    user_id, status, excess
+                )
                 
                 logger.info(f"Enforced limit for user {user_id}, status {status}, deleted {excess} tasks")
     
     except Exception as e:
         logger.error(f"Error enforcing task limits: {e}")
+

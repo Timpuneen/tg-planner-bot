@@ -1,5 +1,4 @@
 from openai import AsyncOpenAI
-from datetime import datetime
 from config import OPENAI_API_KEY
 import logging
 
