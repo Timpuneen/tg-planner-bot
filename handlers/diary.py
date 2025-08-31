@@ -309,8 +309,18 @@ async def show_entries_for_date(message: types.Message, target_date, edit_messag
     for i, entry in enumerate(entries, 1):
         edited_mark = " (edited)" if entry['is_edited'] else ""
         time_str = entry['created_at'].strftime('%H:%M')
+        
+        # Получаем дату создания записи
+        created_date = entry['created_at'].date()
+        
+        # Если запись была создана на другую дату (не на target_date), показываем обе даты
+        if created_date != target_date:
+            date_info = f"📅 {created_date.strftime('%d.%m.%Y')} в {time_str}"
+        else:
+            date_info = f"🕐 {time_str}"
+        
         text += f"{i}. {entry['content']}\n"
-        text += f"🕐 {time_str}{edited_mark}\n\n"
+        text += f"{date_info}{edited_mark}\n\n"
     
     # Создаем инлайн-клавиатуру с кнопками для каждой записи
     keyboard_buttons = []
@@ -369,7 +379,18 @@ async def show_entries_for_period(message: types.Message, start_date, end_date, 
         
         edited_mark = " (edited)" if entry['is_edited'] else ""
         time_str = entry['created_at'].strftime('%H:%M')
-        text += f"• {entry['content']} - {time_str}{edited_mark}\n"
+        
+        # Получаем дату создания записи
+        created_date = entry['created_at'].date()
+        entry_date = entry['entry_date']
+        
+        # Если запись была создана на другую дату, показываем информацию о создании
+        if created_date != entry_date:
+            time_info = f"{time_str} (создано {created_date.strftime('%d.%m.%Y')})"
+        else:
+            time_info = time_str
+        
+        text += f"• {entry['content']} - {time_info}{edited_mark}\n"
     
     # Разбиваем на части, если текст слишком длинный
     if len(text) > 4000:

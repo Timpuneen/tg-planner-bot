@@ -533,42 +533,42 @@ async def save_task(callback, state, deadline):
 # ======= ОСТАЛЬНЫЕ ФУНКЦИИ (групповое отображение и т.д.) =======
 
 def create_tasks_keyboard(tasks_data, status):
-    """Создает клавиатуру для управления задачами"""
+    """Создает клавиатуру для управления задачами с номерами"""
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
     
     keyboard = []
     
-    for task in tasks_data:
+    for i, task in enumerate(tasks_data, 1):
         row = []
         task_id = task['task_id']
         
-        # Кнопка удаления (всегда есть)
+        # Кнопка удаления (всегда есть) с номером задачи
         row.append(InlineKeyboardButton(
-            text="🗑",
+            text=f"🗑#{i}",
             callback_data=f"group_delete_{task_id}_{status}"
         ))
         
         # Дополнительные кнопки в зависимости от статуса
         if status == 'active':
             row.append(InlineKeyboardButton(
-                text="✅",
+                text=f"✅#{i}",
                 callback_data=f"group_complete_{task_id}_{status}"
             ))
             row.append(InlineKeyboardButton(
-                text="❌",
+                text=f"❌#{i}",
                 callback_data=f"group_fail_{task_id}_{status}"
             ))
         elif status == 'overdue':
             row.append(InlineKeyboardButton(
-                text="⏰",
+                text=f"⏰#{i}",
                 callback_data=f"group_extend_{task_id}_{status}"
             ))
             row.append(InlineKeyboardButton(
-                text="✅",
+                text=f"✅#{i}",
                 callback_data=f"group_complete_{task_id}_{status}"
             ))
             row.append(InlineKeyboardButton(
-                text="❌",
+                text=f"❌#{i}",
                 callback_data=f"group_fail_{task_id}_{status}"
             ))
         
