@@ -58,19 +58,19 @@ async def timezone_selected(callback: types.CallbackQuery, state: FSMContext):
     
     # Сохраняем пользователя в базу данных
     async with db.pool.acquire() as conn:
-        # Проверяем, существует ли уже пользователь перед добавлением напоминаний
+        # Проверяем, существует ли уже пользователь
         existing_user = await conn.fetchrow("SELECT user_id FROM users WHERE user_id = $1", user_id)
         is_new_user = existing_user is None
         
-        # Используем ON CONFLICT, но добавляем напоминания только для новых пользователей
+        # Добавляем или обновляем пользователя
         await conn.execute(
             "INSERT INTO users (user_id, timezone) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET timezone = $2",
             user_id, timezone
         )
-        
-        # Добавляем встроенные напоминания только для нового пользователя
-        if is_new_user:
-            await add_built_in_reminders(user_id, conn)
+    
+    # Добавляем встроенные напоминания только для нового пользователя
+    if is_new_user:
+        await add_built_in_reminders(user_id)
     
     await callback.message.edit_text(
         f"✅ Часовой пояс установлен: {timezone}\n"
@@ -121,19 +121,19 @@ async def location_received(message: types.Message, state: FSMContext):
             
             # Сохраняем пользователя в базу данных
             async with db.pool.acquire() as conn:
-                # Проверяем, существует ли уже пользователь перед добавлением напоминаний
+                # Проверяем, существует ли уже пользователь
                 existing_user = await conn.fetchrow("SELECT user_id FROM users WHERE user_id = $1", user_id)
                 is_new_user = existing_user is None
                 
-                # Используем ON CONFLICT, но добавляем напоминания только для новых пользователей
+                # Добавляем или обновляем пользователя
                 await conn.execute(
                     "INSERT INTO users (user_id, timezone) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET timezone = $2",
                     user_id, timezone
                 )
-                
-                # Добавляем встроенные напоминания только для нового пользователя
-                if is_new_user:
-                    await add_built_in_reminders(user_id, conn)
+            
+            # Добавляем встроенные напоминания только для нового пользователя
+            if is_new_user:
+                await add_built_in_reminders(user_id)
             
             await message.answer(
                 f"✅ Часовой пояс определен: {timezone}\n"
@@ -152,31 +152,34 @@ async def location_received(message: types.Message, state: FSMContext):
             )
     
     except Exception as e:
+        logger.error(f"Error determining timezone from location: {e}")
         await message.answer(
             "❌ Произошла ошибка при определении часового пояса.\n"
             "Пожалуйста, выберите из списка:",
             reply_markup=get_timezone_keyboard()
         )
 
-async def add_built_in_reminders(user_id: int, conn):
-    """Добавляет встроенные напоминания для нового пользователя"""
-    # Теперь добавляем только одно напоминание, которое будет определять тип в зависимости от дня
-    built_in_reminder = (
-        "Умное ежедневное напоминание о подведении итогов", 
-        "0 22 * * *", 
-        "ежедневно в 22:00 (с учетом приоритета: год/месяц/неделя/день)"
-    )
-     
+async def add_built_in_reminders(user_id: int):
+    """Добавляет встроенные напоминания для нового пользователя с использованием шифрования"""
+    reminder_text = "Умное ежедневное напоминание о подведении итогов"
+    cron_expression = "0 22 * * *"
+    
     logger.info(f"Adding built-in reminder for new user {user_id}")
     
     try:
-        await conn.execute(
-            """INSERT INTO reminders (user_id, text, reminder_type, cron_expression, is_active, is_built_in) 
-               VALUES ($1, $2, 'recurring', $3, TRUE, TRUE)""",
-            user_id, built_in_reminder[0], built_in_reminder[1]
+        # Используем метод из database/connection.py для создания зашифрованного напоминания
+        reminder_id = await db.create_reminder(
+            user_id=user_id,
+            text=reminder_text,
+            reminder_type='recurring',
+            trigger_time=None,
+            cron_expression=cron_expression,
+            is_built_in=True
         )
-        logger.debug(f"Added smart built-in reminder for user {user_id}")
+        
+        logger.info(f"Successfully added built-in reminder {reminder_id} for user {user_id}")
+        
     except Exception as e:
         logger.error(f"Error adding built-in reminder for user {user_id}: {e}")
-    
-    logger.info(f"Successfully added built-in reminder for user {user_id}")
+        # Не прерываем процесс регистрации из-за ошибки с напоминанием
+        raise

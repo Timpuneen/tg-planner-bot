@@ -17,9 +17,6 @@ class ReminderStates(StatesGroup):
     waiting_for_time = State()
     confirming_reminder = State()
 
-# Временное хранилище для создания напоминания
-reminder_temp_data = {}
-
 def parse_cron_description(cron_expression):
     """Преобразует cron выражение в читаемое описание"""
     if not cron_expression:
@@ -205,21 +202,44 @@ def format_reminders_text_and_keyboard(reminders):
     
     return text, keyboard_buttons
 
-async def get_user_reminders(user_id: int):
-    """Получает все напоминания пользователя из БД"""
-    async with db.pool.acquire() as conn:
-        return await conn.fetch(
-            """SELECT reminder_id, text, reminder_type, trigger_time, cron_expression, 
-                      is_active, is_built_in, created_at 
-               FROM reminders 
-               WHERE user_id = $1 
-               ORDER BY created_at DESC""",
-            user_id
-        )
+async def update_reminders_list_message(message: types.Message, user_id: int):
+    """Обновляет сообщение со списком напоминаний"""
+    # Используем метод из database/connection.py, который автоматически расшифровывает данные
+    reminders = await db.get_user_reminders(user_id)
+    
+    if not reminders:
+        try:
+            await message.edit_text(
+                "📋 У вас пока нет напоминаний",
+                reply_markup=None
+            )
+        except Exception as e:
+            print(f"Error editing message: {e}")
+        return
+    
+    text, keyboard_buttons = format_reminders_text_and_keyboard(reminders)
+    
+    # Telegram имеет лимит на длину сообщения (4096 символов)
+    # Если сообщение слишком длинное, используем только первые 4000 символов
+    if len(text) > 4000:
+        text = text[:3900] + "\n\n... (список слишком большой)"
+    
+    keyboard = types.InlineKeyboardMarkup(inline_keyboard=keyboard_buttons) if keyboard_buttons else None
+    
+    try:
+        await message.edit_text(text, reply_markup=keyboard)
+    except Exception as e:
+        print(f"Error editing message: {e}")
+        # Если редактирование не удалось, отправляем новое сообщение
+        try:
+            await message.answer(text, reply_markup=keyboard)
+        except Exception as e2:
+            print(f"Error sending new message: {e2}")
 
 async def send_reminders_list(message: types.Message, user_id: int):
     """Отправляет список напоминаний с обработкой длинных сообщений"""
-    reminders = await get_user_reminders(user_id)
+    # Используем метод из database/connection.py, который автоматически расшифровывает данные
+    reminders = await db.get_user_reminders(user_id)
     
     if not reminders:
         await message.answer(
@@ -456,52 +476,57 @@ async def confirm_reminder(callback: types.CallbackQuery, state: FSMContext):
         
         scheduler = get_scheduler()
         
-        # Сохраняем напоминание в базу данных
-        async with db.pool.acquire() as conn:
-            if reminder_type == "once":
-                # Разовое напоминание
-                user_trigger_time = datetime.strptime(parsed_result["datetime"], "%Y-%m-%d %H:%M:%S")
-                
-                # 🎯 КЛЮЧЕВОЙ МОМЕНТ: Преобразуем время пользователя в время планировщика
-                scheduler_trigger_time = convert_user_time_to_scheduler_timezone(
-                    user_trigger_time,
-                    user['timezone'],
-                    get_scheduler_timezone()
+        # Сохраняем напоминание в базу данных используя методы с шифрованием
+        if reminder_type == "once":
+            # Разовое напоминание
+            user_trigger_time = datetime.strptime(parsed_result["datetime"], "%Y-%m-%d %H:%M:%S")
+            
+            # 🎯 КЛЮЧЕВОЙ МОМЕНТ: Преобразуем время пользователя в время планировщика
+            scheduler_trigger_time = convert_user_time_to_scheduler_timezone(
+                user_trigger_time,
+                user['timezone'],
+                get_scheduler_timezone()
+            )
+            
+            # Логируем для отладки
+            print(f"User time ({user['timezone']}): {user_trigger_time}")
+            print(f"Scheduler time ({get_scheduler_timezone()}): {scheduler_trigger_time}")
+            
+            # Используем метод create_reminder из database/connection.py (с шифрованием)
+            reminder_id = await db.create_reminder(
+                user_id=user_id,
+                text=reminder_text,
+                reminder_type="once",
+                trigger_time=user_trigger_time,
+                cron_expression=None,
+                is_built_in=False
+            )
+            
+            # Добавляем в планировщик ВРЕМЯ ПЛАНИРОВЩИКА
+            if scheduler:
+                await scheduler.add_once_reminder(
+                    reminder_id, user_id, reminder_text, scheduler_trigger_time
                 )
-                
-                # Логируем для отладки
-                print(f"User time ({user['timezone']}): {user_trigger_time}")
-                print(f"Scheduler time ({get_scheduler_timezone()}): {scheduler_trigger_time}")
-                
-                # Сохраняем в БД ВРЕМЯ ПОЛЬЗОВАТЕЛЯ (для отображения)
-                reminder_id = await conn.fetchval(
-                    """INSERT INTO reminders (user_id, text, reminder_type, trigger_time, is_active) 
-                       VALUES ($1, $2, $3, $4, $5) RETURNING reminder_id""",
-                    user_id, reminder_text, "once", user_trigger_time, True
+            
+        else:
+            # Повторяющееся напоминание
+            # Используем метод create_reminder из database/connection.py (с шифрованием)
+            reminder_id = await db.create_reminder(
+                user_id=user_id,
+                text=reminder_text,
+                reminder_type="recurring",
+                trigger_time=None,
+                cron_expression=parsed_result["cron"],
+                is_built_in=False
+            )
+            
+            # Для повторяющихся напоминаний нужна более сложная логика
+            # Можно настроить планировщик на работу в часовом поясе пользователя
+            if scheduler:
+                await scheduler.add_recurring_reminder_with_timezone(
+                    reminder_id, user_id, reminder_text, 
+                    parsed_result["cron"], user['timezone']
                 )
-                
-                # Добавляем в планировщик ВРЕМЯ ПЛАНИРОВЩИКА
-                if scheduler:
-                    await scheduler.add_once_reminder(
-                        reminder_id, user_id, reminder_text, scheduler_trigger_time
-                    )
-                
-            else:
-                # Повторяющееся напоминание
-                # Для cron выражений преобразование происходит в самом планировщике
-                reminder_id = await conn.fetchval(
-                    """INSERT INTO reminders (user_id, text, reminder_type, cron_expression, is_active) 
-                       VALUES ($1, $2, $3, $4, $5) RETURNING reminder_id""",
-                    user_id, reminder_text, "recurring", parsed_result["cron"], True
-                )
-                
-                # Для повторяющихся напоминаний нужна более сложная логика
-                # Можно настроить планировщик на работу в часовом поясе пользователя
-                if scheduler:
-                    await scheduler.add_recurring_reminder_with_timezone(
-                        reminder_id, user_id, reminder_text, 
-                        parsed_result["cron"], user['timezone']
-                    )
         
         await callback.message.edit_text("✅ Напоминание успешно создано!")
         await callback.message.answer(
@@ -537,144 +562,88 @@ async def handle_reminder_action(callback: types.CallbackQuery, state: FSMContex
     
     scheduler = get_scheduler()
     
-    async with db.pool.acquire() as conn:
-        if action == "delete":
-            # Получаем тип напоминания перед удалением
-            reminder = await conn.fetchrow(
-                "SELECT reminder_type FROM reminders WHERE reminder_id = $1 AND user_id = $2",
-                reminder_id, user_id
-            )
+    if action == "delete":
+        # Получаем тип напоминания перед удалением
+        reminders = await db.get_user_reminders(user_id)
+        reminder = next((r for r in reminders if r['reminder_id'] == reminder_id), None)
+        
+        if reminder:
+            # Удаляем из БД используя метод с поддержкой шифрования
+            success = await db.delete_reminder(reminder_id, user_id)
             
-            if reminder:
-                # Удаляем из БД
-                await conn.execute(
-                    "DELETE FROM reminders WHERE reminder_id = $1 AND user_id = $2",
-                    reminder_id, user_id
-                )
-                
+            if success:
                 # Удаляем из планировщика
                 if scheduler:
                     await scheduler.remove_reminder(reminder_id, reminder['reminder_type'])
-            
-            await callback.answer("Напоминание удалено")
-            
-        elif action == "disable":
-            # Получаем тип напоминания перед отключением
-            reminder = await conn.fetchrow(
-                "SELECT reminder_type FROM reminders WHERE reminder_id = $1 AND user_id = $2",
-                reminder_id, user_id
-            )
-            
-            if reminder:
-                # Отключаем в БД
-                await conn.execute(
-                    "UPDATE reminders SET is_active = FALSE WHERE reminder_id = $1 AND user_id = $2",
-                    reminder_id, user_id
-                )
                 
+                await callback.answer("Напоминание удалено")
+            else:
+                await callback.answer("Ошибка при удалении напоминания")
+        else:
+            await callback.answer("Напоминание не найдено")
+        
+    elif action == "disable":
+        # Получаем тип напоминания перед отключением
+        reminders = await db.get_user_reminders(user_id)
+        reminder = next((r for r in reminders if r['reminder_id'] == reminder_id), None)
+        
+        if reminder:
+            # Отключаем в БД используя метод с поддержкой шифрования
+            success = await db.update_reminder_status(reminder_id, False)
+            
+            if success:
                 # Удаляем из планировщика
                 if scheduler:
                     await scheduler.remove_reminder(reminder_id, reminder['reminder_type'])
-            
-            await callback.answer("Напоминание отключено")
-            
-        elif action == "enable":
-            # Включаем в БД
-            await conn.execute(
-                "UPDATE reminders SET is_active = TRUE WHERE reminder_id = $1 AND user_id = $2",
-                reminder_id, user_id
-            )
-            
+                
+                await callback.answer("Напоминание отключено")
+            else:
+                await callback.answer("Ошибка при отключении напоминания")
+        else:
+            await callback.answer("Напоминание не найдено")
+        
+    elif action == "enable":
+        # Включаем в БД используя метод с поддержкой шифрования
+        success = await db.update_reminder_status(reminder_id, True)
+        
+        if success:
             # Получаем данные напоминания и пользователя для добавления в планировщик
-            reminder_and_user = await conn.fetchrow(
-                """SELECT r.reminder_type, r.text, r.trigger_time, r.cron_expression, u.timezone
-                   FROM reminders r
-                   JOIN users u ON r.user_id = u.user_id
-                   WHERE r.reminder_id = $1 AND r.user_id = $2""",
-                reminder_id, user_id
-            )
+            reminders = await db.get_user_reminders(user_id)
+            reminder = next((r for r in reminders if r['reminder_id'] == reminder_id), None)
             
-            if reminder_and_user and scheduler:
-                if reminder_and_user['reminder_type'] == 'once':
+            # Получаем часовой пояс пользователя
+            async with db.pool.acquire() as conn:
+                user = await conn.fetchrow("SELECT timezone FROM users WHERE user_id = $1", user_id)
+            
+            if reminder and user and scheduler:
+                if reminder['reminder_type'] == 'once':
                     # Проверяем, что время еще не прошло (сравниваем с временем пользователя)
-                    user_current_time = get_user_time(reminder_and_user['timezone']).replace(tzinfo=None)
+                    user_current_time = get_user_time(user['timezone']).replace(tzinfo=None)
                     
-                    if reminder_and_user['trigger_time'] > user_current_time:
+                    if reminder['trigger_time'] > user_current_time:
                         # Преобразуем время пользователя в время планировщика
                         scheduler_trigger_time = convert_user_time_to_scheduler_timezone(
-                            reminder_and_user['trigger_time'],
-                            reminder_and_user['timezone'],
+                            reminder['trigger_time'],
+                            user['timezone'],
                             get_scheduler_timezone()
                         )
                         
                         await scheduler.add_once_reminder(
-                            reminder_id, user_id, reminder_and_user['text'], scheduler_trigger_time
+                            reminder_id, user_id, reminder['text'], scheduler_trigger_time
                         )
                     else:
                         # Время уже прошло, удаляем напоминание
-                        await conn.execute(
-                            "DELETE FROM reminders WHERE reminder_id = $1",
-                            reminder_id
-                        )
+                        await db.delete_reminder(reminder_id, user_id)
                         await callback.answer("Время напоминания уже прошло, оно было удалено")
                         await update_reminders_list_message(callback.message, user_id)
                         return
                 else:
                     # Для повторяющихся напоминаний используем правильный метод
                     await scheduler.add_recurring_reminder_with_timezone(
-                        reminder_id, user_id, reminder_and_user['text'], 
-                        reminder_and_user['cron_expression'], reminder_and_user['timezone']
+                        reminder_id, user_id, reminder['text'], 
+                        reminder['cron_expression'], user['timezone']
                     )
             
             await callback.answer("Напоминание включено")
-    
-    # Обновляем сообщение со списком
-    await update_reminders_list_message(callback.message, user_id)
-
-@router.callback_query(lambda c: c.data.startswith("disable_reminder_"))
-async def disable_reminder(callback: types.CallbackQuery, state: FSMContext):
-    """Отключение напоминания"""
-    await handle_reminder_action(callback, state, "disable")
-
-@router.callback_query(lambda c: c.data.startswith("enable_reminder_"))
-async def enable_reminder(callback: types.CallbackQuery, state: FSMContext):
-    """Включение напоминания"""
-    await handle_reminder_action(callback, state, "enable")
-
-@router.callback_query(lambda c: c.data.startswith("delete_reminder_"))
-async def delete_reminder(callback: types.CallbackQuery, state: FSMContext):
-    """Удаление напоминания"""
-    await handle_reminder_action(callback, state, "delete")
-
-async def update_reminders_list_message(message: types.Message, user_id: int):
-    """Обновляет сообщение со списком напоминаний"""
-    reminders = await get_user_reminders(user_id)
-    
-    if not reminders:
-        try:
-            await message.edit_text(
-                "📋 У вас пока нет напоминаний",
-                reply_markup=None
-            )
-        except Exception as e:
-            print(f"Error editing message: {e}")
-        return
-    
-    text, keyboard_buttons = format_reminders_text_and_keyboard(reminders)
-    
-    # Telegram имеет лимит на длину сообщения (4096 символов)
-    # Если сообщение слишком длинное, используем только первые 4000 символов
-    if len(text) > 4000:
-        text = text[:3900] + "\n\n... (список слишком большой)"
-    
-    keyboard = types.InlineKeyboardMarkup(inline_keyboard=keyboard_buttons) if keyboard_buttons else None
-    
-    try:
-        await message.edit_text(text, reply_markup=keyboard)
-    except Exception as e:
-        print(f"Error editing message: {e}")
-        # Если редактирование не удалось, отправляем новое сообщение
-        try:
-            await message.answer(text, reply_markup=keyboard)
-        except Exception as e2:
-            print(f"Error sending new message: {e2}")
+        else:
+            await callback.answer("Ошибка при включении напоминания")

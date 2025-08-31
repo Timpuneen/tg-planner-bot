@@ -5,7 +5,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 from config import BOT_TOKEN
 from database.connection import db
-from handlers import start, menu, reminders, tasks, diary
+from handlers import start, menu, reminders, tasks, diary, admin  # Добавил admin
 from services.scheduler_service import init_scheduler
 
 # Настройка логирования
@@ -31,6 +31,7 @@ async def main():
         await scheduler.start()
         
         # Регистрация обработчиков
+        dp.include_router(admin.router)  # Добавил admin router первым
         dp.include_router(start.router)
         dp.include_router(menu.router)
         dp.include_router(reminders.router)

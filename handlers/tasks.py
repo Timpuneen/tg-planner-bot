@@ -105,13 +105,13 @@ async def process_task_text(message: types.Message, state: FSMContext):
         )
         return
     
-    # ВАЖНО: Логируем сохранение текста задачи
-    logger.info(f"Saving task text for user {message.from_user.id}: {task_text}")
+    # Логируем сохранение текста задачи (в зашифрованном виде он будет сохранен в БД)
+    logger.info(f"Processing task text for user {message.from_user.id}")
     await state.update_data(task_text=task_text)
     
     # Проверяем, что данные сохранились
     data = await state.get_data()
-    logger.info(f"State data after saving text: {data}")
+    logger.debug(f"State data after saving text: task_text length = {len(data.get('task_text', ''))}")
     
     # Получаем последние 10 уникальных категорий пользователя
     user_id = message.from_user.id
@@ -143,7 +143,7 @@ async def process_category_selection(callback: types.CallbackQuery, state: FSMCo
     
     # Проверяем состояние перед обработкой категории
     data = await state.get_data()
-    logger.info(f"State data before category selection: {data}")
+    logger.debug(f"State data before category selection: task_text exists = {bool(data.get('task_text'))}")
     
     if not data.get("task_text"):
         logger.error("Task text is missing from state!")
@@ -316,7 +316,7 @@ async def process_deadline_selection(callback: types.CallbackQuery, state: FSMCo
     
     # Проверяем состояние перед обработкой дедлайна
     data = await state.get_data()
-    logger.info(f"State data before deadline selection: {data}")
+    logger.debug(f"State data before deadline selection: task_text exists = {bool(data.get('task_text'))}")
     
     if not data.get("task_text"):
         logger.error("Task text is missing from state during deadline selection!")
@@ -460,7 +460,7 @@ async def save_task(callback, state, deadline):
         
         # КРИТИЧЕСКАЯ ПРОВЕРКА: убеждаемся, что task_text не None
         if not task_text:
-            logger.error(f"Critical error: task_text is None or empty! Data: {data}")
+            logger.error(f"Critical error: task_text is None or empty! Data keys: {list(data.keys())}")
             await callback.message.answer(
                 "❌ Критическая ошибка: текст задачи отсутствует. Начните создание заново.",
                 reply_markup=get_tasks_menu_keyboard()
@@ -468,22 +468,19 @@ async def save_task(callback, state, deadline):
             await state.clear()
             return
         
-        logger.info(f"Saving task: user_id={user_id}, text='{task_text}', category='{category}', deadline={deadline}")
+        logger.info(f"Saving task for user {user_id}: category='{category}', has_deadline={deadline is not None}")
         
         # Нормализуем deadline для БД
         normalized_deadline = normalize_datetime_for_db(deadline)
         
-        # Сохраняем задачу
-        async with db.pool.acquire() as conn:
-            result = await conn.execute(
-                """INSERT INTO tasks (user_id, text, category, deadline, status) 
-                   VALUES ($1, $2, $3, $4, 'active')""",
-                user_id, task_text, category, normalized_deadline
-            )
-            logger.info(f"Task saved successfully: {result}")
-            
-            # Сохраняем категорию если она новая
-            if category:
+        # Сохраняем задачу (текст будет автоматически зашифрован в db.create_task)
+        task_id = await db.create_task(user_id, task_text, category, normalized_deadline)
+        
+        logger.info(f"Task saved successfully with ID: {task_id}")
+        
+        # Сохраняем категорию если она новая
+        if category:
+            async with db.pool.acquire() as conn:
                 await conn.execute(
                     """INSERT INTO task_categories (user_id, name) 
                        VALUES ($1, $2) ON CONFLICT DO NOTHING""",
@@ -674,25 +671,9 @@ async def send_tasks_group_message(message: types.Message, status: str, title: s
         # Получаем часовой пояс пользователя
         user = await conn.fetchrow("SELECT timezone FROM users WHERE user_id = $1", user_id)
         user_timezone = user['timezone'] if user else None
-        
-        if status == 'completed':
-            # Для выполненных задач сортируем по дате выполнения
-            tasks = await conn.fetch(
-                """SELECT task_id, text, category, completed_at
-                   FROM tasks 
-                   WHERE user_id = $1 AND status = $2
-                   ORDER BY completed_at DESC""",
-                user_id, status
-            )
-        else:
-            # Для остальных - по категориям и дедлайну
-            tasks = await conn.fetch(
-                """SELECT task_id, text, category, deadline, created_at
-                   FROM tasks 
-                   WHERE user_id = $1 AND status = $2
-                   ORDER BY category NULLS LAST, deadline ASC NULLS LAST""",
-                user_id, status
-            )
+    
+    # Получаем задачи (уже расшифрованные из db)
+    tasks = await db.get_user_tasks(user_id, status)
     
     if not tasks:
         await message.answer(f"{title}\n\nЗадач не найдено")
@@ -811,32 +792,16 @@ async def group_complete_task(callback: types.CallbackQuery):
     current_status = parts[3]
     user_id = callback.from_user.id
     
-    async with db.pool.acquire() as conn:
-        # Проверяем лимит выполненных задач
-        completed_count = await conn.fetchval(
-            "SELECT COUNT(*) FROM tasks WHERE user_id = $1 AND status = 'completed'",
-            user_id
-        )
-        
-        if completed_count >= TASK_LIMITS['completed']:
-            # Удаляем самую старую выполненную задачу
-            await conn.execute(
-                """DELETE FROM tasks WHERE task_id = (
-                    SELECT task_id FROM tasks 
-                    WHERE user_id = $1 AND status = 'completed'
-                    ORDER BY completed_at ASC LIMIT 1
-                )""",
-                user_id
-            )
-        
-        # Отмечаем задачу как выполненную
-        await conn.execute(
-            """UPDATE tasks SET status = 'completed', completed_at = NOW() 
-               WHERE task_id = $1 AND user_id = $2""",
-            task_id, user_id
-        )
+    # Используем методы из db для обновления статуса
+    success = await db.update_task_status(task_id, user_id, 'completed')
     
-    await callback.answer("✅ Задача отмечена как выполненная!")
+    if success:
+        # Проверяем лимит выполненных задач и принудительно применяем его
+        await enforce_task_limits(user_id, 'completed')
+        await callback.answer("✅ Задача отмечена как выполненная!")
+    else:
+        await callback.answer("❌ Ошибка при обновлении задачи")
+        return
     
     # Обновляем сообщение со списком задач
     await refresh_tasks_message(callback, current_status, user_id)
@@ -849,32 +814,16 @@ async def group_fail_task(callback: types.CallbackQuery):
     current_status = parts[3]
     user_id = callback.from_user.id
     
-    async with db.pool.acquire() as conn:
-        # Проверяем лимит невыполненных задач
-        failed_count = await conn.fetchval(
-            "SELECT COUNT(*) FROM tasks WHERE user_id = $1 AND status = 'failed'",
-            user_id
-        )
-        
-        if failed_count >= TASK_LIMITS['failed']:
-            # Удаляем самую старую невыполненную задачу
-            await conn.execute(
-                """DELETE FROM tasks WHERE task_id = (
-                    SELECT task_id FROM tasks 
-                    WHERE user_id = $1 AND status = 'failed'
-                    ORDER BY created_at ASC LIMIT 1
-                )""",
-                user_id
-            )
-        
-        # Отмечаем задачу как невыполненную
-        await conn.execute(
-            """UPDATE tasks SET status = 'failed', completed_at = NOW() 
-               WHERE task_id = $1 AND user_id = $2""",
-            task_id, user_id
-        )
+    # Используем методы из db для обновления статуса
+    success = await db.update_task_status(task_id, user_id, 'failed')
     
-    await callback.answer("❌ Задача отмечена как невыполненная")
+    if success:
+        # Проверяем лимит невыполненных задач и принудительно применяем его
+        await enforce_task_limits(user_id, 'failed')
+        await callback.answer("❌ Задача отмечена как невыполненная")
+    else:
+        await callback.answer("❌ Ошибка при обновлении задачи")
+        return
     
     # Обновляем сообщение со списком задач
     await refresh_tasks_message(callback, current_status, user_id)
@@ -887,13 +836,14 @@ async def group_delete_task(callback: types.CallbackQuery):
     current_status = parts[3]
     user_id = callback.from_user.id
     
-    async with db.pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM tasks WHERE task_id = $1 AND user_id = $2",
-            task_id, user_id
-        )
+    # Используем методы из db для удаления
+    success = await db.delete_task(task_id, user_id)
     
-    await callback.answer("🗑 Задача удалена")
+    if success:
+        await callback.answer("🗑 Задача удалена")
+    else:
+        await callback.answer("❌ Ошибка при удалении задачи")
+        return
     
     # Обновляем сообщение со списком задач
     await refresh_tasks_message(callback, current_status, user_id)
@@ -934,23 +884,9 @@ async def refresh_tasks_message(callback: types.CallbackQuery, status: str, user
         # Получаем часовой пояс пользователя
         user = await conn.fetchrow("SELECT timezone FROM users WHERE user_id = $1", user_id)
         user_timezone = user['timezone'] if user else None
-        
-        if status == 'completed':
-            tasks = await conn.fetch(
-                """SELECT task_id, text, category, completed_at
-                   FROM tasks 
-                   WHERE user_id = $1 AND status = $2
-                   ORDER BY completed_at DESC""",
-                user_id, status
-            )
-        else:
-            tasks = await conn.fetch(
-                """SELECT task_id, text, category, deadline, created_at
-                   FROM tasks 
-                   WHERE user_id = $1 AND status = $2
-                   ORDER BY category NULLS LAST, deadline ASC NULLS LAST""",
-                user_id, status
-            )
+    
+    # Получаем обновленные задачи (уже расшифрованные)
+    tasks = await db.get_user_tasks(user_id, status)
     
     # Если задач больше нет, показываем пустое сообщение
     if not tasks:
@@ -973,8 +909,6 @@ async def refresh_tasks_message(callback: types.CallbackQuery, status: str, user
         logger.error(f"Error updating message: {e}")
 
 # ======= ОБРАБОТКА РАСШИРЕНИЯ ДЕДЛАЙНА =======
-
-
 
 @router.message(TaskStates.waiting_for_extend_deadline)
 async def process_extend_custom_deadline_input(message: types.Message, state: FSMContext):
@@ -1119,39 +1053,6 @@ async def check_overdue_tasks():
         
     except Exception as e:
         logger.error(f"Error checking overdue tasks: {e}")
-
-# async def send_task_reminders():
-#     """Отправка напоминаний о задачах (вызывается планировщиком в 22:00)"""
-#     try:
-#         from bot import bot  # Импортируем бота
-        
-#         async with db.pool.acquire() as conn:
-#             users = await conn.fetch("SELECT user_id, timezone FROM users")
-            
-#             for user in users:
-#                 current_time = get_user_time(user['timezone'])
-#                 tomorrow = current_time + timedelta(days=1)
-#                 tomorrow_utc = normalize_datetime_for_db(tomorrow)
-                
-#                 # Получаем задачи на завтра
-#                 tomorrow_tasks = await conn.fetch(
-#                     """SELECT text, category FROM tasks 
-#                        WHERE user_id = $1 AND status = 'active' 
-#                        AND deadline IS NOT NULL 
-#                        AND DATE(deadline) = DATE($2)""",
-#                     user['user_id'], tomorrow_utc
-#                 )
-                
-#                 if tomorrow_tasks:
-#                     reminder_text = "⏰ Напоминание о задачах на завтра:\n\n"
-#                     for task in tomorrow_tasks:
-#                         category_text = f" ({task['category']})" if task['category'] else ""
-#                         reminder_text += f"• {task['text']}{category_text}\n"
-                    
-#                     await bot.send_message(user['user_id'], reminder_text)
-        
-#     except Exception as e:
-#         logger.error(f"Error sending task reminders: {e}")
 
 async def enforce_task_limits(user_id: int, status: str):
     """Принудительное соблюдение лимитов задач"""

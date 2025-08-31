@@ -9,3 +9,4 @@ timezonefinderL==4.0.2
 APScheduler==3.10.4
 asyncio==3.4.3
 geopy==2.4.1
+cryptography==42.0.5

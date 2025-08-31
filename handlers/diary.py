@@ -3,12 +3,14 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from datetime import datetime, timedelta
 import re
+import logging
 
 from database.connection import db
 from keyboards.keyboards import get_diary_menu_keyboard, get_back_to_main_keyboard
 from services.timezone_service import get_user_time
 
 router = Router()
+logger = logging.getLogger(__name__)
 
 class DiaryStates(StatesGroup):
     waiting_for_entry = State()
@@ -105,39 +107,31 @@ async def process_custom_date(message: types.Message, state: FSMContext):
             )
             return
         
-        # Сохраняем запись
+        # Сохраняем запись используя метод из database/connection.py
         data = await state.get_data()
         entry_text = data.get("entry_text")
         
-        print(f"DEBUG: Saving custom date entry - user_id: {user_id}, date: {target_date}, text: {entry_text[:50]}...")
-        
-        async with db.pool.acquire() as conn:
-            result = await conn.execute(
-                """INSERT INTO diary_entries (user_id, entry_date, content) 
-                   VALUES ($1, $2, $3)""",
-                user_id, target_date, entry_text
-            )
-            print(f"DEBUG: Custom date insert result: {result}")
+        try:
+            entry_id = await db.create_diary_entry(user_id, target_date, entry_text)
+            logger.info(f"Created diary entry {entry_id} for user {user_id} on {target_date}")
             
-            # Проверяем, что запись действительно сохранилась
-            check = await conn.fetchval(
-                "SELECT COUNT(*) FROM diary_entries WHERE user_id = $1 AND entry_date = $2",
-                user_id, target_date
+            await message.answer(
+                f"✅ Запись добавлена в дневник!\n\n"
+                f"📅 Дата: {target_date.strftime('%d.%m.%Y')}\n"
+                f"📝 Запись: {entry_text[:200]}{'...' if len(entry_text) > 200 else ''}"
             )
-            print(f"DEBUG: Records count for custom date: {check}")
-        
-        await message.answer(
-            f"✅ Запись добавлена в дневник!\n\n"
-            f"📅 Дата: {target_date.strftime('%d.%m.%Y')}\n"
-            f"📝 Запись: {entry_text[:200]}{'...' if len(entry_text) > 200 else ''}"
-        )
-        
-        await message.answer(
-            "Что дальше?",
-            reply_markup=get_diary_menu_keyboard()
-        )
-        
-        await state.clear()
+            
+            await message.answer(
+                "Что дальше?",
+                reply_markup=get_diary_menu_keyboard()
+            )
+            
+            await state.clear()
+        except Exception as e:
+            logger.error(f"Failed to create diary entry: {e}")
+            await message.answer(
+                "❌ Произошла ошибка при сохранении записи. Попробуйте еще раз."
+            )
     
     except ValueError:
         await message.answer(
@@ -154,37 +148,28 @@ async def process_diary_date(callback: types.CallbackQuery, state: FSMContext):
     entry_text = data.get("entry_text")
     user_id = callback.from_user.id
     
-    # Добавляем отладочный вывод
-    print(f"DEBUG: Saving entry - user_id: {user_id}, date: {target_date}, text: {entry_text[:50]}...")
-    
-    # Сохраняем запись в дневнике
-    async with db.pool.acquire() as conn:
-        result = await conn.execute(
-            """INSERT INTO diary_entries (user_id, entry_date, content) 
-               VALUES ($1, $2, $3)""",
-            user_id, target_date, entry_text
-        )
-        print(f"DEBUG: Insert result: {result}")
+    # Сохраняем запись используя метод из database/connection.py
+    try:
+        entry_id = await db.create_diary_entry(user_id, target_date, entry_text)
+        logger.info(f"Created diary entry {entry_id} for user {user_id} on {target_date}")
         
-        # Проверяем, что запись действительно сохранилась
-        check = await conn.fetchval(
-            "SELECT COUNT(*) FROM diary_entries WHERE user_id = $1 AND entry_date = $2",
-            user_id, target_date
+        await callback.message.edit_text(
+            f"✅ Запись добавлена в дневник!\n\n"
+            f"📅 Дата: {target_date.strftime('%d.%m.%Y')}\n"
+            f"📝 Запись: {entry_text[:200]}{'...' if len(entry_text) > 200 else ''}"
         )
-        print(f"DEBUG: Records count for this date: {check}")
-    
-    await callback.message.edit_text(
-        f"✅ Запись добавлена в дневник!\n\n"
-        f"📅 Дата: {target_date.strftime('%d.%m.%Y')}\n"
-        f"📝 Запись: {entry_text[:200]}{'...' if len(entry_text) > 200 else ''}"
-    )
-    
-    await callback.message.answer(
-        "Что дальше?",
-        reply_markup=get_diary_menu_keyboard()
-    )
-    
-    await state.clear()
+        
+        await callback.message.answer(
+            "Что дальше?",
+            reply_markup=get_diary_menu_keyboard()
+        )
+        
+        await state.clear()
+    except Exception as e:
+        logger.error(f"Failed to create diary entry: {e}")
+        await callback.message.edit_text(
+            "❌ Произошла ошибка при сохранении записи. Попробуйте еще раз."
+        )
 
 @router.message(lambda message: message.text == "📖 Просмотр записей")
 async def view_diary_entries(message: types.Message):
@@ -299,22 +284,14 @@ async def show_entries_for_date(message: types.Message, target_date, edit_messag
     if user_id is None:
         user_id = message.from_user.id if hasattr(message, 'from_user') else message.chat.id
     
-    async with db.pool.acquire() as conn:
-        # Добавляем отладочный вывод
-        print(f"DEBUG: Searching for entries - user_id: {user_id}, target_date: {target_date}, type: {type(target_date)}")
-        
-        entries = await conn.fetch(
-            """SELECT entry_id, content, created_at, is_edited 
-               FROM diary_entries 
-               WHERE user_id = $1 AND entry_date = $2 
-               ORDER BY created_at ASC""",
-            user_id, target_date
-        )
-        
-        print(f"DEBUG: Found {len(entries)} entries")
-        if entries:
-            for entry in entries:
-                print(f"DEBUG: Entry {entry['entry_id']}: {entry['content'][:50]}...")
+    try:
+        # Используем метод из database/connection.py для получения расшифрованных записей
+        entries = await db.get_diary_entries_by_date(user_id, target_date)
+        logger.info(f"Retrieved {len(entries)} diary entries for user {user_id} on {target_date}")
+    except Exception as e:
+        logger.error(f"Failed to retrieve diary entries: {e}")
+        await message.answer("❌ Произошла ошибка при получении записей")
+        return
     
     if not entries:
         text = f"📖 За {target_date.strftime('%d.%m.%Y')} записей нет"
@@ -336,7 +313,6 @@ async def show_entries_for_date(message: types.Message, target_date, edit_messag
         text += f"🕐 {time_str}{edited_mark}\n\n"
     
     # Создаем инлайн-клавиатуру с кнопками для каждой записи
-    # Используем порядковый номер записи вместо entry_id для отображения
     keyboard_buttons = []
     
     for i, entry in enumerate(entries, 1):
@@ -368,19 +344,14 @@ async def show_entries_for_period(message: types.Message, start_date, end_date, 
     if user_id is None:
         user_id = message.from_user.id if hasattr(message, 'from_user') else message.chat.id
     
-    async with db.pool.acquire() as conn:
-        # Добавляем отладочный вывод
-        print(f"DEBUG: Searching for period entries - user_id: {user_id}, start: {start_date}, end: {end_date}")
-        
-        entries = await conn.fetch(
-            """SELECT entry_date, content, created_at, is_edited 
-               FROM diary_entries 
-               WHERE user_id = $1 AND entry_date BETWEEN $2 AND $3 
-               ORDER BY entry_date DESC, created_at ASC""",
-            user_id, start_date, end_date
-        )
-        
-        print(f"DEBUG: Found {len(entries)} entries for period")
+    try:
+        # Используем метод из database/connection.py для получения расшифрованных записей
+        entries = await db.get_diary_entries_by_period(user_id, start_date, end_date)
+        logger.info(f"Retrieved {len(entries)} diary entries for user {user_id} for period {start_date} - {end_date}")
+    except Exception as e:
+        logger.error(f"Failed to retrieve diary entries for period: {e}")
+        await message.answer("❌ Произошла ошибка при получении записей")
+        return
     
     if not entries:
         await message.answer(
@@ -466,10 +437,19 @@ async def edit_entry(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("Запись не найдена", show_alert=True)
         return
     
+    # Расшифровываем содержимое для отображения
+    try:
+        from services.encryption_service import decrypt_text
+        decrypted_content = decrypt_text(entry['content'])
+    except Exception as e:
+        logger.error(f"Failed to decrypt entry {entry_id} for editing: {e}")
+        await callback.answer("❌ Ошибка при расшифровке записи", show_alert=True)
+        return
+    
     await state.update_data(edit_entry_id=entry_id)
     await callback.message.edit_text(
         f"✏️ Редактирование записи\n\n"
-        f"Текущий текст: {entry['content']}\n\n"
+        f"Текущий текст: {decrypted_content}\n\n"
         f"Введите новый текст записи:"
     )
     await state.set_state(DiaryStates.waiting_for_edit)
@@ -482,24 +462,22 @@ async def process_edit(message: types.Message, state: FSMContext):
     entry_id = data.get("edit_entry_id")
     user_id = message.from_user.id
     
-    # Обновляем запись
-    async with db.pool.acquire() as conn:
-        result = await conn.execute(
-            """UPDATE diary_entries 
-               SET content = $1, updated_at = NOW(), is_edited = TRUE 
-               WHERE entry_id = $2 AND user_id = $3""",
-            new_content, entry_id, user_id
-        )
+    try:
+        # Обновляем запись используя метод из database/connection.py
+        success = await db.update_diary_entry(entry_id, user_id, new_content)
         
-        # Получаем дату записи для возврата к просмотру
-        entry_date = await conn.fetchval(
-            "SELECT entry_date FROM diary_entries WHERE entry_id = $1",
-            entry_id
-        )
-    
-    await message.answer("✅ Запись успешно обновлена!")
-    await show_entries_for_date(message, entry_date, user_id=user_id)
-    await state.clear()
+        if success:
+            # Получаем дату записи для возврата к просмотру
+            entry_date = await db.get_diary_entry_date(entry_id)
+            
+            await message.answer("✅ Запись успешно обновлена!")
+            await show_entries_for_date(message, entry_date, user_id=user_id)
+            await state.clear()
+        else:
+            await message.answer("❌ Не удалось обновить запись")
+    except Exception as e:
+        logger.error(f"Failed to update diary entry {entry_id}: {e}")
+        await message.answer("❌ Произошла ошибка при обновлении записи")
 
 @router.callback_query(lambda c: c.data.startswith("delete_entry_"))
 async def delete_entry_confirm(callback: types.CallbackQuery):
@@ -518,6 +496,14 @@ async def delete_entry_confirm(callback: types.CallbackQuery):
         await callback.answer("Запись не найдена", show_alert=True)
         return
     
+    # Расшифровываем содержимое для отображения
+    try:
+        from services.encryption_service import decrypt_text
+        decrypted_content = decrypt_text(entry['content'])
+    except Exception as e:
+        logger.error(f"Failed to decrypt entry {entry_id} for deletion confirmation: {e}")
+        decrypted_content = "[Ошибка расшифровки]"
+    
     # Клавиатура подтверждения
     keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -529,7 +515,7 @@ async def delete_entry_confirm(callback: types.CallbackQuery):
     await callback.message.edit_text(
         f"🗑️ Удаление записи\n\n"
         f"Вы уверены, что хотите удалить эту запись?\n\n"
-        f"📝 {entry['content'][:100]}{'...' if len(entry['content']) > 100 else ''}\n\n"
+        f"📝 {decrypted_content[:100]}{'...' if len(decrypted_content) > 100 else ''}\n\n"
         f"⚠️ Это действие нельзя отменить!",
         reply_markup=keyboard
     )
@@ -540,24 +526,24 @@ async def delete_entry(callback: types.CallbackQuery):
     entry_id = int(callback.data.replace("confirm_delete_", ""))
     user_id = callback.from_user.id
     
-    # Получаем дату записи перед удалением
-    async with db.pool.acquire() as conn:
-        entry_date = await conn.fetchval(
-            "SELECT entry_date FROM diary_entries WHERE entry_id = $1 AND user_id = $2",
-            entry_id, user_id
-        )
+    try:
+        # Получаем дату записи перед удалением
+        entry_date = await db.get_diary_entry_date(entry_id)
         
         if entry_date:
-            # Удаляем запись
-            await conn.execute(
-                "DELETE FROM diary_entries WHERE entry_id = $1 AND user_id = $2",
-                entry_id, user_id
-            )
+            # Удаляем запись используя метод из database/connection.py
+            success = await db.delete_diary_entry(entry_id, user_id)
             
-            await callback.message.edit_text("✅ Запись удалена!")
-            await show_entries_for_date(callback.message, entry_date, user_id=user_id)
+            if success:
+                await callback.message.edit_text("✅ Запись удалена!")
+                await show_entries_for_date(callback.message, entry_date, user_id=user_id)
+            else:
+                await callback.answer("❌ Не удалось удалить запись", show_alert=True)
         else:
             await callback.answer("Запись не найдена", show_alert=True)
+    except Exception as e:
+        logger.error(f"Failed to delete diary entry {entry_id}: {e}")
+        await callback.answer("❌ Произошла ошибка при удалении", show_alert=True)
 
 @router.callback_query(lambda c: c.data.startswith("cancel_delete_"))
 async def cancel_delete(callback: types.CallbackQuery):
@@ -565,14 +551,14 @@ async def cancel_delete(callback: types.CallbackQuery):
     entry_id = int(callback.data.replace("cancel_delete_", ""))
     user_id = callback.from_user.id
     
-    # Получаем дату записи для возврата к просмотру
-    async with db.pool.acquire() as conn:
-        entry_date = await conn.fetchval(
-            "SELECT entry_date FROM diary_entries WHERE entry_id = $1 AND user_id = $2",
-            entry_id, user_id
-        )
-    
-    if entry_date:
-        await show_entries_for_date(callback.message, entry_date, edit_message=True, user_id=user_id)
-    else:
-        await callback.answer("Запись не найдена", show_alert=True)
+    try:
+        # Получаем дату записи для возврата к просмотру
+        entry_date = await db.get_diary_entry_date(entry_id)
+        
+        if entry_date:
+            await show_entries_for_date(callback.message, entry_date, edit_message=True, user_id=user_id)
+        else:
+            await callback.answer("Запись не найдена", show_alert=True)
+    except Exception as e:
+        logger.error(f"Failed to get diary entry date {entry_id}: {e}")
+        await callback.answer("❌ Произошла ошибка", show_alert=True)

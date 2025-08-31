@@ -12,6 +12,12 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # Database settings
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost/telegram_bot")
 
+# Admin settings
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))  # Добавь свой Telegram ID в .env
+
+# Encryption settings
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")  # Добавь в .env файл
+
 # Popular timezones
 POPULAR_TIMEZONES = [
     ("UTC", "UTC"),
