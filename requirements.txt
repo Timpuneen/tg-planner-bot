@@ -1,0 +1,11 @@
+aiogram==3.7.0
+aiohttp==3.9.5
+sqlalchemy==2.0.30
+asyncpg==0.29.0
+python-dotenv==1.0.1
+openai==1.101.0
+pytz==2024.1
+timezonefinderL==4.0.2
+APScheduler==3.10.4
+asyncio==3.4.3
+geopy==2.4.1

@@ -1,0 +1,578 @@
+from aiogram import Router, types, F
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from datetime import datetime, timedelta
+import re
+
+from database.connection import db
+from keyboards.keyboards import get_diary_menu_keyboard, get_back_to_main_keyboard
+from services.timezone_service import get_user_time
+
+router = Router()
+
+class DiaryStates(StatesGroup):
+    waiting_for_entry = State()
+    waiting_for_date = State()
+    waiting_for_custom_date = State()
+    waiting_for_period_start = State()
+    waiting_for_period_end = State()
+    waiting_for_edit = State()
+
+@router.message(lambda message: message.text == "✍️ Новая запись")
+async def create_diary_entry(message: types.Message, state: FSMContext):
+    """Создание новой записи в дневнике"""
+    await message.answer(
+        "✍️ Новая запись в дневнике\n\n"
+        "Введите текст записи:",
+        reply_markup=get_back_to_main_keyboard()
+    )
+    await state.set_state(DiaryStates.waiting_for_entry)
+
+@router.message(DiaryStates.waiting_for_entry)
+async def process_diary_entry(message: types.Message, state: FSMContext):
+    """Обработка текста записи"""
+    if message.text == "🏠 Главное меню":
+        await state.clear()
+        return
+    
+    entry_text = message.text
+    await state.update_data(entry_text=entry_text)
+    
+    user_id = message.from_user.id
+    
+    # Получаем часовой пояс пользователя
+    async with db.pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT timezone FROM users WHERE user_id = $1", user_id)
+    
+    current_time = get_user_time(user['timezone'])
+    current_date = current_time.date()
+    
+    # Клавиатура выбора даты
+    keyboard_buttons = [
+        [types.InlineKeyboardButton(text=f"Сегодня ({current_date.strftime('%d.%m.%Y')})", 
+                                   callback_data=f"diary_date_{current_date.isoformat()}")]
+    ]
+    
+    # Добавляем вчера
+    yesterday = current_date - timedelta(days=1)
+    keyboard_buttons.append([
+        types.InlineKeyboardButton(
+            text=f"Вчера ({yesterday.strftime('%d.%m.%Y')})", 
+            callback_data=f"diary_date_{yesterday.isoformat()}"
+        )
+    ])
+    
+    keyboard_buttons.append([
+        types.InlineKeyboardButton(text="📅 Выбрать другую дату", callback_data="diary_custom_date")
+    ])
+    
+    keyboard = types.InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    
+    await message.answer(
+        f"✅ Текст записи: {entry_text[:100]}{'...' if len(entry_text) > 100 else ''}\n\n"
+        "Выберите дату для записи:",
+        reply_markup=keyboard
+    )
+
+@router.callback_query(lambda c: c.data == "diary_custom_date")
+async def ask_custom_date(callback: types.CallbackQuery, state: FSMContext):
+    """Запрос пользовательской даты"""
+    await callback.message.edit_text(
+        "📅 Введите дату в формате ДД.ММ.ГГГГ (например, 25.02.2025):"
+    )
+    await state.set_state(DiaryStates.waiting_for_custom_date)
+
+@router.message(DiaryStates.waiting_for_custom_date)
+async def process_custom_date(message: types.Message, state: FSMContext):
+    """Обработка пользовательской даты"""
+    date_input = message.text.strip()
+    
+    try:
+        # Проверяем формат даты
+        target_date = datetime.strptime(date_input, "%d.%m.%Y").date()
+        
+        # Проверяем, что дата не в будущем
+        user_id = message.from_user.id
+        async with db.pool.acquire() as conn:
+            user = await conn.fetchrow("SELECT timezone FROM users WHERE user_id = $1", user_id)
+        
+        current_time = get_user_time(user['timezone'])
+        current_date = current_time.date()
+        
+        if target_date > current_date:
+            await message.answer(
+                "❌ Нельзя создавать записи на будущие даты. Введите прошедшую дату или сегодняшнюю:"
+            )
+            return
+        
+        # Сохраняем запись
+        data = await state.get_data()
+        entry_text = data.get("entry_text")
+        
+        print(f"DEBUG: Saving custom date entry - user_id: {user_id}, date: {target_date}, text: {entry_text[:50]}...")
+        
+        async with db.pool.acquire() as conn:
+            result = await conn.execute(
+                """INSERT INTO diary_entries (user_id, entry_date, content) 
+                   VALUES ($1, $2, $3)""",
+                user_id, target_date, entry_text
+            )
+            print(f"DEBUG: Custom date insert result: {result}")
+            
+            # Проверяем, что запись действительно сохранилась
+            check = await conn.fetchval(
+                "SELECT COUNT(*) FROM diary_entries WHERE user_id = $1 AND entry_date = $2",
+                user_id, target_date
+            )
+            print(f"DEBUG: Records count for custom date: {check}")
+        
+        await message.answer(
+            f"✅ Запись добавлена в дневник!\n\n"
+            f"📅 Дата: {target_date.strftime('%d.%m.%Y')}\n"
+            f"📝 Запись: {entry_text[:200]}{'...' if len(entry_text) > 200 else ''}"
+        )
+        
+        await message.answer(
+            "Что дальше?",
+            reply_markup=get_diary_menu_keyboard()
+        )
+        
+        await state.clear()
+    
+    except ValueError:
+        await message.answer(
+            "❌ Неверный формат даты. Введите дату в формате ДД.ММ.ГГГГ (например, 25.02.2025):"
+        )
+
+@router.callback_query(lambda c: c.data.startswith("diary_date_"))
+async def process_diary_date(callback: types.CallbackQuery, state: FSMContext):
+    """Обработка выбранной даты для записи"""
+    date_str = callback.data.replace("diary_date_", "")
+    target_date = datetime.fromisoformat(date_str).date()
+    
+    data = await state.get_data()
+    entry_text = data.get("entry_text")
+    user_id = callback.from_user.id
+    
+    # Добавляем отладочный вывод
+    print(f"DEBUG: Saving entry - user_id: {user_id}, date: {target_date}, text: {entry_text[:50]}...")
+    
+    # Сохраняем запись в дневнике
+    async with db.pool.acquire() as conn:
+        result = await conn.execute(
+            """INSERT INTO diary_entries (user_id, entry_date, content) 
+               VALUES ($1, $2, $3)""",
+            user_id, target_date, entry_text
+        )
+        print(f"DEBUG: Insert result: {result}")
+        
+        # Проверяем, что запись действительно сохранилась
+        check = await conn.fetchval(
+            "SELECT COUNT(*) FROM diary_entries WHERE user_id = $1 AND entry_date = $2",
+            user_id, target_date
+        )
+        print(f"DEBUG: Records count for this date: {check}")
+    
+    await callback.message.edit_text(
+        f"✅ Запись добавлена в дневник!\n\n"
+        f"📅 Дата: {target_date.strftime('%d.%m.%Y')}\n"
+        f"📝 Запись: {entry_text[:200]}{'...' if len(entry_text) > 200 else ''}"
+    )
+    
+    await callback.message.answer(
+        "Что дальше?",
+        reply_markup=get_diary_menu_keyboard()
+    )
+    
+    await state.clear()
+
+@router.message(lambda message: message.text == "📖 Просмотр записей")
+async def view_diary_entries(message: types.Message):
+    """Просмотр записей дневника"""
+    user_id = message.from_user.id
+    
+    # Получаем часовой пояс пользователя
+    async with db.pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT timezone FROM users WHERE user_id = $1", user_id)
+    
+    current_time = get_user_time(user['timezone'])
+    current_date = current_time.date()
+    
+    # Клавиатура для выбора периода просмотра
+    keyboard_buttons = [
+        [types.InlineKeyboardButton(text="Сегодня", callback_data=f"view_diary_{current_date.isoformat()}")],
+        [types.InlineKeyboardButton(text="Вчера", callback_data=f"view_diary_{(current_date - timedelta(days=1)).isoformat()}")],
+        [types.InlineKeyboardButton(text="📅 Своя дата", callback_data="view_diary_custom")],
+        [types.InlineKeyboardButton(text="📊 Выбрать период", callback_data="view_diary_period")]
+    ]
+    
+    keyboard = types.InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    
+    await message.answer(
+        "📖 Просмотр записей дневника\n\n"
+        "Выберите период:",
+        reply_markup=keyboard
+    )
+
+@router.callback_query(lambda c: c.data == "view_diary_custom")
+async def ask_view_date(callback: types.CallbackQuery, state: FSMContext):
+    """Запрос даты для просмотра"""
+    await callback.message.edit_text(
+        "📅 Введите дату для просмотра в формате ДД.ММ.ГГГГ (например, 25.02.2025):"
+    )
+    await state.set_state(DiaryStates.waiting_for_date)
+
+@router.message(DiaryStates.waiting_for_date)
+async def process_view_date(message: types.Message, state: FSMContext):
+    """Обработка даты для просмотра"""
+    date_input = message.text.strip()
+    
+    try:
+        target_date = datetime.strptime(date_input, "%d.%m.%Y").date()
+        await show_entries_for_date(message, target_date, user_id=message.from_user.id)
+        await state.clear()
+    except ValueError:
+        await message.answer(
+            "❌ Неверный формат даты. Введите дату в формате ДД.ММ.ГГГГ (например, 25.02.2025):"
+        )
+
+@router.callback_query(lambda c: c.data == "view_diary_period")
+async def ask_period_start(callback: types.CallbackQuery, state: FSMContext):
+    """Запрос начальной даты периода"""
+    await callback.message.edit_text(
+        "📅 Введите начальную дату периода в формате ДД.ММ.ГГГГ (например, 20.02.2025):"
+    )
+    await state.set_state(DiaryStates.waiting_for_period_start)
+
+@router.message(DiaryStates.waiting_for_period_start)
+async def process_period_start(message: types.Message, state: FSMContext):
+    """Обработка начальной даты периода"""
+    date_input = message.text.strip()
+    
+    try:
+        start_date = datetime.strptime(date_input, "%d.%m.%Y").date()
+        await state.update_data(start_date=start_date)
+        
+        await message.answer(
+            f"✅ Начальная дата: {start_date.strftime('%d.%m.%Y')}\n\n"
+            "Введите конечную дату периода в формате ДД.ММ.ГГГГ:"
+        )
+        await state.set_state(DiaryStates.waiting_for_period_end)
+    except ValueError:
+        await message.answer(
+            "❌ Неверный формат даты. Введите дату в формате ДД.ММ.ГГГГ (например, 20.02.2025):"
+        )
+
+@router.message(DiaryStates.waiting_for_period_end)
+async def process_period_end(message: types.Message, state: FSMContext):
+    """Обработка конечной даты периода"""
+    date_input = message.text.strip()
+    
+    try:
+        end_date = datetime.strptime(date_input, "%d.%m.%Y").date()
+        data = await state.get_data()
+        start_date = data.get("start_date")
+        
+        if end_date < start_date:
+            await message.answer(
+                "❌ Конечная дата не может быть раньше начальной. Введите корректную конечную дату:"
+            )
+            return
+        
+        await show_entries_for_period(message, start_date, end_date, user_id=message.from_user.id)
+        await state.clear()
+    except ValueError:
+        await message.answer(
+            "❌ Неверный формат даты. Введите дату в формате ДД.ММ.ГГГГ (например, 25.02.2025):"
+        )
+
+@router.callback_query(lambda c: c.data.startswith("view_diary_2"))
+async def show_diary_entries(callback: types.CallbackQuery):
+    """Показать записи дневника за конкретный день"""
+    date_str = callback.data.replace("view_diary_", "")
+    target_date = datetime.fromisoformat(date_str).date()
+    
+    await show_entries_for_date(callback.message, target_date, edit_message=True, user_id=callback.from_user.id)
+
+async def show_entries_for_date(message: types.Message, target_date, edit_message=False, user_id=None):
+    """Показать записи за конкретную дату с кнопками управления"""
+    if user_id is None:
+        user_id = message.from_user.id if hasattr(message, 'from_user') else message.chat.id
+    
+    async with db.pool.acquire() as conn:
+        # Добавляем отладочный вывод
+        print(f"DEBUG: Searching for entries - user_id: {user_id}, target_date: {target_date}, type: {type(target_date)}")
+        
+        entries = await conn.fetch(
+            """SELECT entry_id, content, created_at, is_edited 
+               FROM diary_entries 
+               WHERE user_id = $1 AND entry_date = $2 
+               ORDER BY created_at ASC""",
+            user_id, target_date
+        )
+        
+        print(f"DEBUG: Found {len(entries)} entries")
+        if entries:
+            for entry in entries:
+                print(f"DEBUG: Entry {entry['entry_id']}: {entry['content'][:50]}...")
+    
+    if not entries:
+        text = f"📖 За {target_date.strftime('%d.%m.%Y')} записей нет"
+        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text="🔙 Назад к выбору", callback_data="back_to_view_menu")]
+        ])
+        if edit_message:
+            await message.edit_text(text, reply_markup=keyboard)
+        else:
+            await message.answer(text, reply_markup=keyboard)
+        return
+    
+    text = f"📖 Записи за {target_date.strftime('%d.%m.%Y')}:\n\n"
+    
+    for i, entry in enumerate(entries, 1):
+        edited_mark = " (edited)" if entry['is_edited'] else ""
+        time_str = entry['created_at'].strftime('%H:%M')
+        text += f"{i}. {entry['content']}\n"
+        text += f"🕐 {time_str}{edited_mark}\n\n"
+    
+    # Создаем инлайн-клавиатуру с кнопками для каждой записи
+    # Используем порядковый номер записи вместо entry_id для отображения
+    keyboard_buttons = []
+    
+    for i, entry in enumerate(entries, 1):
+        row = [
+            types.InlineKeyboardButton(
+                text=f"✏️ Редактировать #{i}", 
+                callback_data=f"edit_entry_{entry['entry_id']}"
+            ),
+            types.InlineKeyboardButton(
+                text=f"🗑️ Удалить #{i}", 
+                callback_data=f"delete_entry_{entry['entry_id']}"
+            )
+        ]
+        keyboard_buttons.append(row)
+    
+    keyboard_buttons.append([
+        types.InlineKeyboardButton(text="🔙 Назад к выбору", callback_data="back_to_view_menu")
+    ])
+    
+    keyboard = types.InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    
+    if edit_message:
+        await message.edit_text(text[:4000], reply_markup=keyboard)
+    else:
+        await message.answer(text[:4000], reply_markup=keyboard)
+
+async def show_entries_for_period(message: types.Message, start_date, end_date, user_id=None):
+    """Показать записи за период"""
+    if user_id is None:
+        user_id = message.from_user.id if hasattr(message, 'from_user') else message.chat.id
+    
+    async with db.pool.acquire() as conn:
+        # Добавляем отладочный вывод
+        print(f"DEBUG: Searching for period entries - user_id: {user_id}, start: {start_date}, end: {end_date}")
+        
+        entries = await conn.fetch(
+            """SELECT entry_date, content, created_at, is_edited 
+               FROM diary_entries 
+               WHERE user_id = $1 AND entry_date BETWEEN $2 AND $3 
+               ORDER BY entry_date DESC, created_at ASC""",
+            user_id, start_date, end_date
+        )
+        
+        print(f"DEBUG: Found {len(entries)} entries for period")
+    
+    if not entries:
+        await message.answer(
+            f"📖 За период с {start_date.strftime('%d.%m.%Y')} по {end_date.strftime('%d.%m.%Y')} записей нет"
+        )
+        return
+    
+    text = f"📖 Записи за период {start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}:\n\n"
+    
+    current_date = None
+    for entry in entries:
+        if current_date != entry['entry_date']:
+            current_date = entry['entry_date']
+            text += f"\n📅 {current_date.strftime('%d.%m.%Y')}\n"
+        
+        edited_mark = " (edited)" if entry['is_edited'] else ""
+        time_str = entry['created_at'].strftime('%H:%M')
+        text += f"• {entry['content']} - {time_str}{edited_mark}\n"
+    
+    # Разбиваем на части, если текст слишком длинный
+    if len(text) > 4000:
+        parts = []
+        current_part = ""
+        lines = text.split('\n')
+        
+        for line in lines:
+            if len(current_part + line + '\n') > 4000:
+                parts.append(current_part)
+                current_part = line + '\n'
+            else:
+                current_part += line + '\n'
+        
+        if current_part:
+            parts.append(current_part)
+        
+        for part in parts:
+            await message.answer(part)
+    else:
+        await message.answer(text)
+
+@router.callback_query(lambda c: c.data == "back_to_view_menu")
+async def back_to_view_menu(callback: types.CallbackQuery):
+    """Возврат к меню просмотра"""
+    user_id = callback.from_user.id
+    
+    # Получаем часовой пояс пользователя
+    async with db.pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT timezone FROM users WHERE user_id = $1", user_id)
+    
+    current_time = get_user_time(user['timezone'])
+    current_date = current_time.date()
+    
+    # Клавиатура для выбора периода просмотра
+    keyboard_buttons = [
+        [types.InlineKeyboardButton(text="Сегодня", callback_data=f"view_diary_{current_date.isoformat()}")],
+        [types.InlineKeyboardButton(text="Вчера", callback_data=f"view_diary_{(current_date - timedelta(days=1)).isoformat()}")],
+        [types.InlineKeyboardButton(text="📅 Своя дата", callback_data="view_diary_custom")],
+        [types.InlineKeyboardButton(text="📊 Выбрать период", callback_data="view_diary_period")]
+    ]
+    
+    keyboard = types.InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    
+    await callback.message.edit_text(
+        "📖 Просмотр записей дневника\n\n"
+        "Выберите период:",
+        reply_markup=keyboard
+    )
+
+@router.callback_query(lambda c: c.data.startswith("edit_entry_"))
+async def edit_entry(callback: types.CallbackQuery, state: FSMContext):
+    """Редактирование записи"""
+    entry_id = int(callback.data.replace("edit_entry_", ""))
+    user_id = callback.from_user.id
+    
+    # Получаем запись для редактирования
+    async with db.pool.acquire() as conn:
+        entry = await conn.fetchrow(
+            "SELECT content FROM diary_entries WHERE entry_id = $1 AND user_id = $2",
+            entry_id, user_id
+        )
+    
+    if not entry:
+        await callback.answer("Запись не найдена", show_alert=True)
+        return
+    
+    await state.update_data(edit_entry_id=entry_id)
+    await callback.message.edit_text(
+        f"✏️ Редактирование записи\n\n"
+        f"Текущий текст: {entry['content']}\n\n"
+        f"Введите новый текст записи:"
+    )
+    await state.set_state(DiaryStates.waiting_for_edit)
+
+@router.message(DiaryStates.waiting_for_edit)
+async def process_edit(message: types.Message, state: FSMContext):
+    """Обработка редактирования записи"""
+    new_content = message.text
+    data = await state.get_data()
+    entry_id = data.get("edit_entry_id")
+    user_id = message.from_user.id
+    
+    # Обновляем запись
+    async with db.pool.acquire() as conn:
+        result = await conn.execute(
+            """UPDATE diary_entries 
+               SET content = $1, updated_at = NOW(), is_edited = TRUE 
+               WHERE entry_id = $2 AND user_id = $3""",
+            new_content, entry_id, user_id
+        )
+        
+        # Получаем дату записи для возврата к просмотру
+        entry_date = await conn.fetchval(
+            "SELECT entry_date FROM diary_entries WHERE entry_id = $1",
+            entry_id
+        )
+    
+    await message.answer("✅ Запись успешно обновлена!")
+    await show_entries_for_date(message, entry_date, user_id=user_id)
+    await state.clear()
+
+@router.callback_query(lambda c: c.data.startswith("delete_entry_"))
+async def delete_entry_confirm(callback: types.CallbackQuery):
+    """Подтверждение удаления записи"""
+    entry_id = int(callback.data.replace("delete_entry_", ""))
+    user_id = callback.from_user.id
+    
+    # Получаем информацию о записи
+    async with db.pool.acquire() as conn:
+        entry = await conn.fetchrow(
+            "SELECT content, entry_date FROM diary_entries WHERE entry_id = $1 AND user_id = $2",
+            entry_id, user_id
+        )
+    
+    if not entry:
+        await callback.answer("Запись не найдена", show_alert=True)
+        return
+    
+    # Клавиатура подтверждения
+    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+        [
+            types.InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"confirm_delete_{entry_id}"),
+            types.InlineKeyboardButton(text="❌ Отмена", callback_data=f"cancel_delete_{entry_id}")
+        ]
+    ])
+    
+    await callback.message.edit_text(
+        f"🗑️ Удаление записи\n\n"
+        f"Вы уверены, что хотите удалить эту запись?\n\n"
+        f"📝 {entry['content'][:100]}{'...' if len(entry['content']) > 100 else ''}\n\n"
+        f"⚠️ Это действие нельзя отменить!",
+        reply_markup=keyboard
+    )
+
+@router.callback_query(lambda c: c.data.startswith("confirm_delete_"))
+async def delete_entry(callback: types.CallbackQuery):
+    """Удаление записи"""
+    entry_id = int(callback.data.replace("confirm_delete_", ""))
+    user_id = callback.from_user.id
+    
+    # Получаем дату записи перед удалением
+    async with db.pool.acquire() as conn:
+        entry_date = await conn.fetchval(
+            "SELECT entry_date FROM diary_entries WHERE entry_id = $1 AND user_id = $2",
+            entry_id, user_id
+        )
+        
+        if entry_date:
+            # Удаляем запись
+            await conn.execute(
+                "DELETE FROM diary_entries WHERE entry_id = $1 AND user_id = $2",
+                entry_id, user_id
+            )
+            
+            await callback.message.edit_text("✅ Запись удалена!")
+            await show_entries_for_date(callback.message, entry_date, user_id=user_id)
+        else:
+            await callback.answer("Запись не найдена", show_alert=True)
+
+@router.callback_query(lambda c: c.data.startswith("cancel_delete_"))
+async def cancel_delete(callback: types.CallbackQuery):
+    """Отмена удаления записи"""
+    entry_id = int(callback.data.replace("cancel_delete_", ""))
+    user_id = callback.from_user.id
+    
+    # Получаем дату записи для возврата к просмотру
+    async with db.pool.acquire() as conn:
+        entry_date = await conn.fetchval(
+            "SELECT entry_date FROM diary_entries WHERE entry_id = $1 AND user_id = $2",
+            entry_id, user_id
+        )
+    
+    if entry_date:
+        await show_entries_for_date(callback.message, entry_date, edit_message=True, user_id=user_id)
+    else:
+        await callback.answer("Запись не найдена", show_alert=True)
