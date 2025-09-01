@@ -1,0 +1,46 @@
+# Виртуальное окружение
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Локальная БД (если используется SQLite)
+*.db
+*.sqlite
+*.sqlite3
+
+# Логи
+*.log
+logs/
+
+# Временные файлы
+.tmp/
+tmp/
+
+# IDE файлы
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Docker
+Dockerfile
+.dockerignore
+
+# Тестовые файлы
+tests/
+.pytest_cache/
+
+# Документация (если не нужна в контейнере)
+README.md
+docs/
+
+# Резервные копии
+*.bak
+*.backup

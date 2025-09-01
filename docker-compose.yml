@@ -1,0 +1,40 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: tg-planner-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: your_database_name
+      POSTGRES_USER: your_username
+      POSTGRES_PASSWORD: your_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - tg-planner-network
+    ports:
+      - "5432:5432"
+
+  tg-planner-bot:
+    build: .
+    container_name: tg-planner-bot
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DATABASE_HOST=postgres
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+    networks:
+      - tg-planner-network
+
+networks:
+  tg-planner-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
