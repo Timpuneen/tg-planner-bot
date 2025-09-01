@@ -299,8 +299,8 @@ class SchedulerService:
             
             user_tasks = [
                 ("daily_motivation", self.send_user_daily_motivation, CronTrigger(hour=8, minute=0, timezone=user_tz)),
-                ("evening_review", self.send_user_evening_review, CronTrigger(hour=23, minute=16, timezone=user_tz)),
-                ("overdue_check", self.check_user_overdue_tasks, CronTrigger(hour=0, minute=30, timezone=user_tz))
+                ("evening_review", self.send_user_evening_review, CronTrigger(hour=23, minute=0, timezone=user_tz)),
+                ("overdue_check", self.check_user_overdue_tasks, CronTrigger(hour=23, minute=35, timezone=user_tz))
             ]
 
             for task_type, func, trigger in user_tasks:
