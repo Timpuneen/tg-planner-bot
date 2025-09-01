@@ -69,7 +69,11 @@ def _decrypt_entry_safely(entry_content: str, entry_id: int) -> str:
 async def _save_diary_entry(user_id: int, target_date, entry_text: str, message: types.Message):
     """Сохранение записи в дневник с обработкой ошибок"""
     try:
-        entry_id = await db.create_diary_entry(user_id, target_date, entry_text)
+        # Получаем текущее время в часовом поясе пользователя
+        user_timezone = await _get_user_timezone(user_id)
+        user_current_time = get_user_time(user_timezone).replace(tzinfo=None)  # убираем tzinfo для совместимости с PostgreSQL
+        
+        entry_id = await db.create_diary_entry(user_id, target_date, entry_text, user_current_time)
         logger.info(f"Created diary entry {entry_id} for user {user_id} on {target_date}")
         return True, entry_id
     except Exception as e:

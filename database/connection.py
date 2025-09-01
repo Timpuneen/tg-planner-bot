@@ -2,6 +2,7 @@ import asyncpg
 from typing import Optional, List, Dict, Any
 from config import DATABASE_URL
 import logging
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -233,15 +234,19 @@ class Database:
     
     # === МЕТОДЫ ДЛЯ РАБОТЫ С ДНЕВНИКОМ ===
     
-    async def create_diary_entry(self, user_id: int, entry_date, content: str) -> int:
+    async def create_diary_entry(self, user_id: int, entry_date, content: str, created_at_user_time=None) -> int:
         """Создание новой записи дневника с шифрованием"""
         encrypted_content = self._encrypt_text(content)
         
+        # Если время не передано, используем текущее время (но это должно быть редко)
+        if created_at_user_time is None:
+            created_at_user_time = datetime.now()
+        
         async with self.pool.acquire() as conn:
             entry_id = await conn.fetchval(
-                """INSERT INTO diary_entries (user_id, entry_date, content) 
-                   VALUES ($1, $2, $3) RETURNING entry_id""",
-                user_id, entry_date, encrypted_content
+                """INSERT INTO diary_entries (user_id, entry_date, content, created_at, updated_at) 
+                VALUES ($1, $2, $3, $4, $4) RETURNING entry_id""",
+                user_id, entry_date, encrypted_content, created_at_user_time
             )
             logger.info(f"Created encrypted diary entry {entry_id} for user {user_id}")
             return entry_id
@@ -283,12 +288,20 @@ class Database:
         """Обновление записи дневника с шифрованием"""
         encrypted_content = self._encrypt_text(content)
         
+        # Получаем текущее время пользователя для updated_at
         async with self.pool.acquire() as conn:
+            user = await conn.fetchrow("SELECT timezone FROM users WHERE user_id = $1", user_id)
+            if user:
+                from services.timezone_service import get_user_time
+                user_current_time = get_user_time(user['timezone']).replace(tzinfo=None)
+            else:
+                user_current_time = datetime.now()
+            
             result = await conn.execute(
                 """UPDATE diary_entries 
-                   SET content = $1, updated_at = NOW(), is_edited = TRUE 
-                   WHERE entry_id = $2 AND user_id = $3""",
-                encrypted_content, entry_id, user_id
+                SET content = $1, updated_at = $2, is_edited = TRUE 
+                WHERE entry_id = $3 AND user_id = $4""",
+                encrypted_content, user_current_time, entry_id, user_id
             )
             return result != "UPDATE 0"
     
