@@ -31,6 +31,8 @@ services:
       - ./backups:/app/backups
     networks:
       - tg-planner-network
+    ports:
+      - "8000:8000"
 
 networks:
   tg-planner-network:

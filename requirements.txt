@@ -10,3 +10,4 @@ APScheduler==3.10.4
 asyncio==3.4.3
 geopy==2.4.1
 cryptography==42.0.5
+aiohttp>=3.8.0
