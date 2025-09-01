@@ -6,7 +6,7 @@ import logging
 
 from database.connection import db
 from keyboards.keyboards import get_diary_menu_keyboard, get_back_to_main_keyboard
-from services.timezone_service import get_user_time
+from services.timezone_service import get_user_time, convert_scheduler_time_to_user_timezone, get_scheduler_timezone
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -315,13 +315,21 @@ async def show_entries_for_date(message: types.Message, target_date, edit_messag
             await message.answer(text, reply_markup=keyboard)
         return
     
+    # Получаем часовой пояс пользователя для конвертации времени
+    user_timezone = await _get_user_timezone(user_id)
+    
     # Формируем текст с записями
     text = f"📖 Записи за {target_date.strftime('%d.%m.%Y')}:\n\n"
     
     for i, entry in enumerate(entries, 1):
         edited_mark = " (edited)" if entry['is_edited'] else ""
-        time_str = entry['created_at'].strftime('%H:%M')
-        created_date = entry['created_at'].date()
+        
+        # Конвертируем время создания из UTC в часовой пояс пользователя
+        user_created_time = convert_scheduler_time_to_user_timezone(
+            entry['created_at'], user_timezone, get_scheduler_timezone()
+        )
+        time_str = user_created_time.strftime('%H:%M')
+        created_date = user_created_time.date()
         
         # Определяем информацию о дате
         if created_date != target_date:
@@ -357,6 +365,9 @@ async def show_entries_for_period(message: types.Message, start_date, end_date, 
         )
         return
     
+    # Получаем часовой пояс пользователя для конвертации времени
+    user_timezone = await _get_user_timezone(user_id)
+    
     # Формируем текст с записями по датам
     text = f"📖 Записи за период {start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}:\n\n"
     
@@ -367,8 +378,13 @@ async def show_entries_for_period(message: types.Message, start_date, end_date, 
             text += f"\n📅 {current_date.strftime('%d.%m.%Y')}\n"
         
         edited_mark = " (edited)" if entry['is_edited'] else ""
-        time_str = entry['created_at'].strftime('%H:%M')
-        created_date = entry['created_at'].date()
+        
+        # Конвертируем время создания из UTC в часовой пояс пользователя
+        user_created_time = convert_scheduler_time_to_user_timezone(
+            entry['created_at'], user_timezone, get_scheduler_timezone()
+        )
+        time_str = user_created_time.strftime('%H:%M')
+        created_date = user_created_time.date()
         entry_date = entry['entry_date']
         
         # Информация о времени создания
