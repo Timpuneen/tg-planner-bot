@@ -629,4 +629,3 @@ async def disable_reminder(callback: types.CallbackQuery, state: FSMContext):
 @router.callback_query(lambda c: c.data.startswith("enable_reminder_"))
 async def enable_reminder(callback: types.CallbackQuery, state: FSMContext):
     await handle_reminder_action(callback, state, "enable")
-

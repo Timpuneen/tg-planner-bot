@@ -66,7 +66,7 @@ class SchedulerService:
         logger.info("Scheduler started")
 
         await self.load_active_reminders()
-        await self.setup_system_tasks()
+        await self.setup_user_system_tasks()
 
     async def stop(self):
         """Остановка планировщика"""
@@ -267,102 +267,103 @@ class SchedulerService:
         except Exception as e:
             logger.error(f"Error sending reminder: {e}")
 
-    async def setup_system_tasks(self):
-        """Системные задачи"""
-        system_jobs = [
-            ("daily_motivation", self.send_daily_motivation, CronTrigger(hour=8, minute=0)),
-            ("evening_review", self.send_evening_review, CronTrigger(hour=20, minute=0)),
-            ("overdue_check", self.check_overdue_tasks, CronTrigger(hour=0, minute=30)),
-            ("daily_backup", self.send_daily_backup, CronTrigger(hour=12, minute=0)) 
-        ]
-
-        try:
-            for job_id, func, trigger in system_jobs:
-                self.scheduler.add_job(
-                    func,
-                    trigger=trigger,
-                    id=job_id,
-                    replace_existing=True
-                )
-
-            logger.info("System tasks setup completed")
-
-        except Exception as e:
-            logger.error(f"Error setting up system tasks: {e}")
-
-    async def send_daily_motivation(self):
-        """Утренние мотивации (упрощенная версия без кнопок)"""
-        try:
-            async with db.pool.acquire() as conn:
-                users = await conn.fetch("SELECT user_id FROM users")
-
-            motivation = await generate_daily_motivation()
-            message = f"🌅 Доброе утро!\n\n{motivation}"
-
-            for user in users:
-                try:
-                    await self.bot.send_message(user['user_id'], message)
-                except Exception as e:
-                    logger.error(f"Error sending morning message to user {user['user_id']}: {e}")
-
-        except Exception as e:
-            logger.error(f"Error sending daily motivation: {e}")
-
-    async def send_evening_review(self):
-        """Вечерние ревью с записями дневника и задачами на сегодня"""
+    async def setup_user_system_tasks(self):
+        """Системные задачи для каждого пользователя с учетом их часового пояса"""
         try:
             async with db.pool.acquire() as conn:
                 users = await conn.fetch("SELECT user_id, timezone FROM users")
 
             for user in users:
                 try:
-                    await self.send_user_evening_review(user['user_id'])
+                    await self.create_user_system_tasks(user['user_id'], user['timezone'])
                 except Exception as e:
-                    logger.error(f"Error sending evening review to user {user['user_id']}: {e}")
+                    logger.error(f"Error creating system tasks for user {user['user_id']}: {e}")
+
+            # Глобальная задача бэкапа остается в UTC
+            self.scheduler.add_job(
+                self.send_daily_backup,
+                trigger=CronTrigger(hour=12, minute=0),
+                id="daily_backup",
+                replace_existing=True
+            )
+
+            logger.info(f"System tasks setup completed for {len(users)} users")
 
         except Exception as e:
-            logger.error(f"Error in send_evening_review: {e}")
+            logger.error(f"Error setting up user system tasks: {e}")
 
-    def _decrypt_content_safely(self, content: str, content_type: str, user_id: int) -> str:
-        """Безопасная расшифровка контента с обработкой ошибок"""
+    async def create_user_system_tasks(self, user_id: int, timezone_str: str):
+        """Создает персональные системные задачи для пользователя"""
         try:
-            return decrypt_text(content)
-        except Exception as e:
-            logger.error(f"Failed to decrypt {content_type} for user {user_id}: {e}")
-            return "[Ошибка расшифровки]"
-
-    def _group_tasks_by_status(self, tasks: list, user_id: int) -> dict:
-        """Группировка задач по статусам с расшифровкой"""
-        groups = {
-            'completed': [],
-            'failed': [],
-            'active': [],
-            'overdue': []
-        }
-        
-        for task in tasks:
-            decrypted_text = self._decrypt_content_safely(task['text'], 'task', user_id)
-            task_dict = dict(task)
-            task_dict['text'] = decrypted_text
+            user_tz = pytz.timezone(timezone_str)
             
-            if task['status'] in groups:
-                groups[task['status']].append(task_dict)
-        
-        return groups
+            user_tasks = [
+                ("daily_motivation", self.send_user_daily_motivation, CronTrigger(hour=8, minute=0, timezone=user_tz)),
+                ("evening_review", self.send_user_evening_review, CronTrigger(hour=23, minute=16, timezone=user_tz)),
+                ("overdue_check", self.check_user_overdue_tasks, CronTrigger(hour=0, minute=30, timezone=user_tz))
+            ]
 
-    def _format_task_group(self, tasks: list, title: str, icon: str) -> str:
-        """Форматирование группы задач для отображения"""
-        if not tasks:
-            return ""
+            for task_type, func, trigger in user_tasks:
+                job_id = f"{task_type}_{user_id}"
+                self.scheduler.add_job(
+                    func,
+                    trigger=trigger,
+                    args=[user_id],
+                    id=job_id,
+                    replace_existing=True
+                )
+
+            logger.info(f"Created system tasks for user {user_id} in timezone {timezone_str}")
+
+        except Exception as e:
+            logger.error(f"Error creating system tasks for user {user_id}: {e}")
+
+    async def update_user_system_tasks(self, user_id: int, new_timezone: str):
+        """Обновляет системные задачи пользователя при смене часового пояса"""
+        try:
+            # Удаляем старые задачи
+            await self.remove_user_system_tasks(user_id)
+            
+            # Создаем новые с новым часовым поясом
+            await self.create_user_system_tasks(user_id, new_timezone)
+            
+            logger.info(f"Updated system tasks for user {user_id} to timezone {new_timezone}")
+
+        except Exception as e:
+            logger.error(f"Error updating system tasks for user {user_id}: {e}")
+
+    async def remove_user_system_tasks(self, user_id: int):
+        """Удаляет все системные задачи пользователя"""
+        task_types = ["daily_motivation", "evening_review", "overdue_check"]
         
-        result = f"{icon} {title}:\n"
-        for task in tasks:
-            category_text = f" ({task['category']})" if task['category'] else ""
-            result += f"  • {task['text']}{category_text}\n"
-        result += "\n"
-        return result
+        for task_type in task_types:
+            job_id = f"{task_type}_{user_id}"
+            try:
+                if self.scheduler.get_job(job_id):
+                    self.scheduler.remove_job(job_id)
+            except Exception as e:
+                logger.error(f"Error removing {task_type} task for user {user_id}: {e}")
+
+    async def send_user_daily_motivation(self, user_id: int):
+        """Утренняя мотивация для конкретного пользователя"""
+        try:
+            motivation = await generate_daily_motivation()
+            message = f"🌅 Доброе утро!\n\n{motivation}"
+            await self.bot.send_message(user_id, message)
+            
+        except Exception as e:
+            logger.error(f"Error sending daily motivation to user {user_id}: {e}")
 
     async def send_user_evening_review(self, user_id: int):
+        """Вечернее ревью для конкретного пользователя"""
+        try:
+            # Используем существующий метод, который уже правильно работает с часовыми поясами
+            await self.send_user_evening_review_detailed(user_id)
+            
+        except Exception as e:
+            logger.error(f"Error sending evening review to user {user_id}: {e}")
+
+    async def send_user_evening_review_detailed(self, user_id: int):
         """Формирует и отправляет ревью дня конкретному пользователю с расшифровкой данных"""
         try:
             async with db.pool.acquire() as conn:
@@ -438,6 +439,107 @@ class SchedulerService:
         except Exception as e:
             logger.error(f"Error sending evening review to user {user_id}: {e}")
 
+    async def check_user_overdue_tasks(self, user_id: int):
+        """Проверка и пометка просроченных задач для конкретного пользователя"""
+        TASK_LIMITS = {
+            'active': 50,
+            'completed': 50,
+            'failed': 25,
+            'overdue': 25
+        }
+        
+        try:
+            async with db.pool.acquire() as conn:
+                user = await conn.fetchrow("SELECT timezone FROM users WHERE user_id = $1", user_id)
+                if not user:
+                    logger.error(f"User {user_id} not found")
+                    return
+
+                user_tz = pytz.timezone(user['timezone'])
+                current_time = get_user_time(user['timezone'])
+                current_utc = self._normalize_datetime_for_db(current_time)
+                
+                # Получаем просроченные задачи и текущее количество
+                overdue_tasks, overdue_count = await asyncio.gather(
+                    conn.fetch(
+                        """SELECT task_id FROM tasks 
+                           WHERE user_id = $1 AND status = 'active' 
+                           AND deadline IS NOT NULL AND deadline < $2""",
+                        user_id, current_utc
+                    ),
+                    conn.fetchval(
+                        "SELECT COUNT(*) FROM tasks WHERE user_id = $1 AND status = 'overdue'",
+                        user_id
+                    )
+                )
+                
+                if overdue_tasks:
+                    tasks_to_mark = len(overdue_tasks)
+                    
+                    # Если превышаем лимит, удаляем самые старые просроченные
+                    if overdue_count + tasks_to_mark > TASK_LIMITS['overdue']:
+                        delete_count = (overdue_count + tasks_to_mark) - TASK_LIMITS['overdue']
+                        await conn.execute(
+                            """DELETE FROM tasks WHERE task_id IN (
+                                SELECT task_id FROM tasks 
+                                WHERE user_id = $1 AND status = 'overdue'
+                                ORDER BY marked_overdue_at ASC LIMIT $2
+                            )""",
+                            user_id, delete_count
+                        )
+                    
+                    # Помечаем задачи как просроченные
+                    task_ids = [task['task_id'] for task in overdue_tasks]
+                    await conn.execute(
+                        """UPDATE tasks SET status = 'overdue', marked_overdue_at = NOW() 
+                           WHERE task_id = ANY($1::int[])""",
+                        task_ids
+                    )
+                    
+                    logger.info(f"Marked {len(task_ids)} tasks as overdue for user {user_id}")
+        
+        except Exception as e:
+            logger.error(f"Error checking overdue tasks for user {user_id}: {e}")
+
+    def _decrypt_content_safely(self, content: str, content_type: str, user_id: int) -> str:
+        """Безопасная расшифровка контента с обработкой ошибок"""
+        try:
+            return decrypt_text(content)
+        except Exception as e:
+            logger.error(f"Failed to decrypt {content_type} for user {user_id}: {e}")
+            return "[Ошибка расшифровки]"
+
+    def _group_tasks_by_status(self, tasks: list, user_id: int) -> dict:
+        """Группировка задач по статусам с расшифровкой"""
+        groups = {
+            'completed': [],
+            'failed': [],
+            'active': [],
+            'overdue': []
+        }
+        
+        for task in tasks:
+            decrypted_text = self._decrypt_content_safely(task['text'], 'task', user_id)
+            task_dict = dict(task)
+            task_dict['text'] = decrypted_text
+            
+            if task['status'] in groups:
+                groups[task['status']].append(task_dict)
+        
+        return groups
+
+    def _format_task_group(self, tasks: list, title: str, icon: str) -> str:
+        """Форматирование группы задач для отображения"""
+        if not tasks:
+            return ""
+        
+        result = f"{icon} {title}:\n"
+        for task in tasks:
+            category_text = f" ({task['category']})" if task['category'] else ""
+            result += f"  • {task['text']}{category_text}\n"
+        result += "\n"
+        return result
+
     def _get_day_utc_bounds(self, date, timezone_str):
         """Получает UTC границы дня для заданной даты в часовом поясе пользователя"""
         user_tz = pytz.timezone(timezone_str)
@@ -451,70 +553,6 @@ class SchedulerService:
         day_end_utc = day_end_local.astimezone(pytz.UTC).replace(tzinfo=None)
         
         return day_start_utc, day_end_utc
-
-    async def check_overdue_tasks(self):
-        """Проверка и пометка просроченных задач"""
-        TASK_LIMITS = {
-            'active': 50,
-            'completed': 50,
-            'failed': 25,
-            'overdue': 25
-        }
-        
-        try:
-            async with db.pool.acquire() as conn:
-                users = await conn.fetch("SELECT user_id, timezone FROM users")
-                
-                for user in users:
-                    try:
-                        user_tz = pytz.timezone(user['timezone'])
-                        current_time = get_user_time(user['timezone'])
-                        current_utc = self._normalize_datetime_for_db(current_time)
-                        
-                        # Получаем просроченные задачи и текущее количество
-                        overdue_tasks, overdue_count = await asyncio.gather(
-                            conn.fetch(
-                                """SELECT task_id FROM tasks 
-                                   WHERE user_id = $1 AND status = 'active' 
-                                   AND deadline IS NOT NULL AND deadline < $2""",
-                                user['user_id'], current_utc
-                            ),
-                            conn.fetchval(
-                                "SELECT COUNT(*) FROM tasks WHERE user_id = $1 AND status = 'overdue'",
-                                user['user_id']
-                            )
-                        )
-                        
-                        if overdue_tasks:
-                            tasks_to_mark = len(overdue_tasks)
-                            
-                            # Если превышаем лимит, удаляем самые старые просроченные
-                            if overdue_count + tasks_to_mark > TASK_LIMITS['overdue']:
-                                delete_count = (overdue_count + tasks_to_mark) - TASK_LIMITS['overdue']
-                                await conn.execute(
-                                    """DELETE FROM tasks WHERE task_id IN (
-                                        SELECT task_id FROM tasks 
-                                        WHERE user_id = $1 AND status = 'overdue'
-                                        ORDER BY marked_overdue_at ASC LIMIT $2
-                                    )""",
-                                    user['user_id'], delete_count
-                                )
-                            
-                            # Помечаем задачи как просроченные
-                            task_ids = [task['task_id'] for task in overdue_tasks]
-                            await conn.execute(
-                                """UPDATE tasks SET status = 'overdue', marked_overdue_at = NOW() 
-                                   WHERE task_id = ANY($1::int[])""",
-                                task_ids
-                            )
-                            
-                            logger.info(f"Marked {len(task_ids)} tasks as overdue for user {user['user_id']}")
-                    
-                    except Exception as e:
-                        logger.error(f"Error checking overdue tasks for user {user['user_id']}: {e}")
-        
-        except Exception as e:
-            logger.error(f"Error in check_overdue_tasks: {e}")
 
     def _normalize_datetime_for_db(self, dt):
         """Нормализует datetime для сохранения в базу данных"""
@@ -536,6 +574,16 @@ class SchedulerService:
             logger.info("Daily backup task completed")
         except Exception as e:
             logger.error(f"Error in daily backup task: {e}")
+
+    # Методы для управления пользователями (новые пользователи, смена часового пояса)
+    async def add_new_user_system_tasks(self, user_id: int, timezone_str: str):
+        """Добавляет системные задачи для нового пользователя"""
+        try:
+            await self.create_user_system_tasks(user_id, timezone_str)
+            logger.info(f"Added system tasks for new user {user_id}")
+        except Exception as e:
+            logger.error(f"Error adding system tasks for new user {user_id}: {e}")
+
 
 # Глобальный экземпляр
 scheduler_service = None
