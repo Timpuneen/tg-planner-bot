@@ -122,6 +122,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     except Exception as e:
-        logger.error(f"Critical error: {e}")
+        logger.error(f"Critical error: {e}")  
         # Автоматический перезапуск через несколько секунд
         exit(1)
