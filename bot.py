@@ -24,10 +24,12 @@ dp = Dispatcher(storage=storage)
 
 async def health_check(request):
     """Keepalive endpoint для Railway"""
+    print(f"Health check at {request.path}")
     return web.Response(text="OK", status=200)
 
 async def stats_endpoint(request):
     """Дополнительный endpoint с простой статистикой"""
+    print(f"Stats check at {request.path}")
     try:
         async with db.pool.acquire() as conn:
             users_count = await conn.fetchval("SELECT COUNT(*) FROM users")
