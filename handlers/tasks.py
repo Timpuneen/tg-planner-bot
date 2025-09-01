@@ -212,6 +212,9 @@ async def process_category_selection(callback: types.CallbackQuery, state: FSMCo
     """Обработка выбора категории"""
     action = callback.data.replace("category_", "")
     
+    # ВАЖНО: Отвечаем на callback
+    await callback.answer()
+    
     # Проверяем состояние перед обработкой категории
     if not await validate_task_state(state, callback, True):
         return
@@ -241,7 +244,7 @@ async def process_category_selection(callback: types.CallbackQuery, state: FSMCo
             category_index = int(action.split("_")[-1])
             category = categories[category_index]['category']
         except (ValueError, IndexError):
-            await callback.answer("❌ Ошибка выбора категории")
+            # Уже вызвали callback.answer(), поэтому просто возвращаемся
             return
     
     await state.update_data(category=category)
@@ -291,6 +294,9 @@ async def process_deadline_common(callback: types.CallbackQuery, state: FSMConte
     action = callback.data.replace("deadline_", "")
     user_id = callback.from_user.id
     
+    # ВАЖНО: Сразу отвечаем на callback, чтобы убрать подсветку кнопки
+    await callback.answer()
+    
     # Получаем часовой пояс пользователя
     async with db.pool.acquire() as conn:
         user = await conn.fetchrow("SELECT timezone FROM users WHERE user_id = $1", user_id)
@@ -314,7 +320,7 @@ async def process_deadline_common(callback: types.CallbackQuery, state: FSMConte
             
     except Exception as e:
         logger.error(f"Error creating deadline: {e}")
-        await callback.answer("❌ Ошибка при создании дедлайна")
+        # Уже вызвали callback.answer() выше, поэтому не нужно повторно
 
 @router.callback_query(lambda c: c.data.startswith("deadline_") and c.message.text.startswith("⏰ Выберите новый дедлайн"))
 async def process_extend_deadline_callback(callback: types.CallbackQuery, state: FSMContext):
