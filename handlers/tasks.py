@@ -310,7 +310,7 @@ async def process_deadline_common(callback: types.CallbackQuery, state: FSMConte
         if is_extend:
             await complete_extend_task(callback, state, deadline)
         else:
-            await save_task(callback, state, deadline)
+            await save_task(callback, state, deadline, is_from_message=False)
             
     except Exception as e:
         logger.error(f"Error creating deadline: {e}")
@@ -376,16 +376,16 @@ async def process_custom_deadline_common(message: types.Message, state: FSMConte
             )
             return
         
-        # Создаем фиктивный callback для передачи в функцию
-        fake_callback = types.CallbackQuery(
-            id="fake", from_user=message.from_user, chat_instance="fake", 
-            message=message, data="fake"
-        )
-        
         if is_extend:
+            # Для продления создаем фиктивный callback
+            fake_callback = types.CallbackQuery(
+                id="fake", from_user=message.from_user, chat_instance="fake", 
+                message=message, data="fake"
+            )
             await complete_extend_task(fake_callback, state, deadline)
         else:
-            await save_task(fake_callback, state, deadline)
+            # Для создания задачи передаем message напрямую с флагом
+            await save_task(message, state, deadline, is_from_message=True)
         
     except (ValueError, IndexError) as e:
         logger.error(f"Error parsing custom deadline: {e}")
@@ -406,18 +406,25 @@ async def process_extend_custom_deadline_input(message: types.Message, state: FS
     """Обработка ввода произвольного дедлайна при продлении"""
     await process_custom_deadline_common(message, state, is_extend=True)
 
-async def save_task(callback, state, deadline):
+async def save_task(callback_or_message, state, deadline, is_from_message=False):
     """Сохранение задачи в базу данных"""
     try:
         data = await state.get_data()
         task_text = data.get("task_text")
         category = data.get("category")
-        user_id = callback.from_user.id
+        
+        # Получаем user_id в зависимости от типа объекта
+        if is_from_message:
+            user_id = callback_or_message.from_user.id
+            message_obj = callback_or_message
+        else:
+            user_id = callback_or_message.from_user.id
+            message_obj = callback_or_message.message
         
         # КРИТИЧЕСКАЯ ПРОВЕРКА: убеждаемся, что task_text не None
         if not task_text:
             logger.error(f"Critical error: task_text is None or empty! Data keys: {list(data.keys())}")
-            await callback.message.answer(
+            await message_obj.answer(
                 "❌ Критическая ошибка: текст задачи отсутствует. Начните создание заново.",
                 reply_markup=get_tasks_menu_keyboard()
             )
@@ -463,9 +470,10 @@ async def save_task(callback, state, deadline):
             f"📅 Дедлайн: {deadline_text}"
         )
         
-        await send_message_with_fallback(callback, success_message, is_callback=hasattr(callback, 'id') and callback.id != "fake")
+        # Отправляем сообщение напрямую через message объект
+        await message_obj.answer(success_message)
         
-        await callback.message.answer(
+        await message_obj.answer(
             "Что дальше?",
             reply_markup=get_tasks_menu_keyboard()
         )
@@ -474,7 +482,9 @@ async def save_task(callback, state, deadline):
         
     except Exception as e:
         logger.error(f"Error saving task: {e}", exc_info=True)
-        await callback.message.answer(
+        # Используем правильный message объект для отправки ошибки
+        message_obj = callback_or_message if is_from_message else callback_or_message.message
+        await message_obj.answer(
             "❌ Ошибка при сохранении задачи. Попробуйте еще раз.",
             reply_markup=get_tasks_menu_keyboard()
         )
@@ -848,7 +858,9 @@ async def complete_extend_task(callback, state: FSMContext, new_deadline):
     if hasattr(callback, 'id') and callback.id != "fake":
         await callback.answer(f"✅ Задача продлена до {deadline_text}")
     
-    await callback.message.answer(
+    # Используем правильный message объект
+    message_obj = callback.message
+    await message_obj.answer(
         f"✅ Задача продлена до {deadline_text}",
         reply_markup=get_tasks_menu_keyboard()
     )
@@ -951,4 +963,3 @@ async def enforce_task_limits(user_id: int, status: str):
     
     except Exception as e:
         logger.error(f"Error enforcing task limits: {e}")
-
