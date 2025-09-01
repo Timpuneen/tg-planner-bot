@@ -923,7 +923,7 @@ async def process_overdue_tasks_for_users(users):
                 logger.info(f"Marked {len(task_ids)} tasks as overdue for user {user['user_id']}")
 
 async def check_overdue_tasks():
-    """Проверка и пометка просроченных задач (вызывается планировщиком в 00:30)"""
+    """Проверка и пометка просроченных задач (вызывается планировщиком в 00:00)"""
     try:
         async with db.pool.acquire() as conn:
             # Получаем всех пользователей с их часовыми поясами
