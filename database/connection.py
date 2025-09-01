@@ -256,6 +256,7 @@ class Database:
                    ORDER BY created_at ASC""",
                 user_id, entry_date
             )
+            print(f"---------------------------------Fetched {len(entries)} entries for user {user_id} on date {entry_date}-----------------------------------")
         
         return self._decrypt_items(entries, 'content', 'entry_id', 'diary entry')
     
