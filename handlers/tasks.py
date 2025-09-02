@@ -586,8 +586,9 @@ def format_tasks_message(tasks_data, title, user_timezone=None):
                 deadline_display = pytz.UTC.localize(task['deadline']).astimezone(pytz.timezone(user_timezone))
                 deadline_date = deadline_display.date()
                 
-                # Выделяем задачи на сегодня
-                if current_date and deadline_date == current_date:
+                # Выделяем задачи на сегодня ТОЛЬКО если они активные
+                if (current_date and deadline_date == current_date and 
+                    task.get('status') == 'active'):
                     task_prefix = "🚨 "
                 
                 deadline_text = f" (📅 {deadline_display.strftime('%d.%m.%Y')})"

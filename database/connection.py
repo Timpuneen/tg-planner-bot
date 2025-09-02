@@ -153,13 +153,32 @@ class Database:
     async def update_task_status(self, task_id: int, user_id: int, status: str) -> bool:
         """Обновление статуса задачи"""
         async with self.pool.acquire() as conn:
-            result = await conn.execute(
-                """UPDATE tasks SET status = $1, 
-                   completed_at = CASE WHEN $1 = 'completed' THEN NOW() ELSE completed_at END,
-                   marked_overdue_at = CASE WHEN $1 = 'overdue' THEN NOW() ELSE marked_overdue_at END
-                   WHERE task_id = $2 AND user_id = $3""",
-                status, task_id, user_id
-            )
+            # Используем явное приведение типов и разделяем логику для избежания конфликта типов
+            if status in ('completed', 'failed'):
+                result = await conn.execute(
+                    """UPDATE tasks 
+                    SET status = $1::varchar, 
+                        completed_at = NOW()
+                    WHERE task_id = $2 AND user_id = $3""",
+                    status, task_id, user_id
+                )
+            elif status == 'overdue':
+                result = await conn.execute(
+                    """UPDATE tasks 
+                    SET status = $1::varchar, 
+                        marked_overdue_at = NOW()
+                    WHERE task_id = $2 AND user_id = $3""",
+                    status, task_id, user_id
+                )
+            else:
+                # Для других статусов (например, 'active')
+                result = await conn.execute(
+                    """UPDATE tasks 
+                    SET status = $1::varchar
+                    WHERE task_id = $2 AND user_id = $3""",
+                    status, task_id, user_id
+                )
+            
             return result != "UPDATE 0"
     
     async def delete_task(self, task_id: int, user_id: int) -> bool:
