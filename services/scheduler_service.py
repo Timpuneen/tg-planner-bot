@@ -6,6 +6,7 @@ from datetime import datetime, time, timedelta
 import calendar
 import pytz
 import logging
+import asyncpg
 
 from services.timezone_service import convert_user_time_to_scheduler_timezone, get_scheduler_timezone, get_user_time
 from database.connection import db
@@ -449,31 +450,42 @@ class SchedulerService:
         }
         
         try:
+            # ИСПРАВЛЕНИЕ: Используем отдельные соединения для каждой операции
+            # и добавляем блокировки на уровне записей
+            
+            # Получаем данные пользователя
             async with db.pool.acquire() as conn:
                 user = await conn.fetchrow("SELECT timezone FROM users WHERE user_id = $1", user_id)
-                if not user:
-                    logger.error(f"User {user_id} not found")
-                    return
-
-                user_tz = pytz.timezone(user['timezone'])
-                current_time = get_user_time(user['timezone'])
-                current_utc = self._normalize_datetime_for_db(current_time)
                 
-                # Получаем просроченные задачи и текущее количество
-                overdue_tasks, overdue_count = await asyncio.gather(
-                    conn.fetch(
+            if not user:
+                logger.error(f"User {user_id} not found")
+                return
+
+            user_tz = pytz.timezone(user['timezone'])
+            current_time = get_user_time(user['timezone'])
+            current_utc = self._normalize_datetime_for_db(current_time)
+            
+            # Выполняем все операции в рамках одной транзакции для атомарности
+            async with db.pool.acquire() as conn:
+                async with conn.transaction():
+                    # Получаем просроченные задачи с блокировкой
+                    overdue_tasks = await conn.fetch(
                         """SELECT task_id FROM tasks 
-                           WHERE user_id = $1 AND status = 'active' 
-                           AND deadline IS NOT NULL AND deadline < $2""",
+                        WHERE user_id = $1 AND status = 'active' 
+                        AND deadline IS NOT NULL AND deadline < $2
+                        FOR UPDATE SKIP LOCKED""",  # Пропускаем заблокированные записи
                         user_id, current_utc
-                    ),
-                    conn.fetchval(
+                    )
+                    
+                    if not overdue_tasks:
+                        return  # Нет просроченных задач
+                    
+                    # Считаем текущее количество просроченных задач
+                    overdue_count = await conn.fetchval(
                         "SELECT COUNT(*) FROM tasks WHERE user_id = $1 AND status = 'overdue'",
                         user_id
                     )
-                )
-                
-                if overdue_tasks:
+                    
                     tasks_to_mark = len(overdue_tasks)
                     
                     # Если превышаем лимит, удаляем самые старые просроченные
@@ -489,15 +501,22 @@ class SchedulerService:
                         )
                     
                     # Помечаем задачи как просроченные
-                    task_ids = [task['task_id'] for task in overdue_tasks]
-                    await conn.execute(
-                        """UPDATE tasks SET status = 'overdue', marked_overdue_at = NOW() 
-                           WHERE task_id = ANY($1::int[])""",
-                        task_ids
-                    )
-                    
-                    logger.info(f"Marked {len(task_ids)} tasks as overdue for user {user_id}")
+                    if overdue_tasks:
+                        task_ids = [task['task_id'] for task in overdue_tasks]
+                        await conn.execute(
+                            """UPDATE tasks SET status = 'overdue', marked_overdue_at = NOW() 
+                            WHERE task_id = ANY($1::int[])""",
+                            task_ids
+                        )
+                        
+                        logger.info(f"Marked {len(task_ids)} tasks as overdue for user {user_id}")
         
+        except asyncpg.InterfaceError as e:
+            if "another operation is in progress" in str(e).lower():
+                # Логируем и пропускаем, задача выполнится в следующий раз
+                logger.warning(f"Skipping overdue check for user {user_id}: database busy")
+            else:
+                logger.error(f"Interface error checking overdue tasks for user {user_id}: {e}")
         except Exception as e:
             logger.error(f"Error checking overdue tasks for user {user_id}: {e}")
 

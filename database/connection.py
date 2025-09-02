@@ -2,19 +2,33 @@ import asyncpg
 from typing import Optional, List, Dict, Any
 from config import DATABASE_URL
 import logging
+import asyncio
 
 logger = logging.getLogger(__name__)
 
 class Database:
     def __init__(self):
         self.pool = None
+        # Семафор для ограничения одновременных операций
+        self._operation_semaphore = asyncio.Semaphore(15)
     
     async def connect(self):
         """Создание пула соединений с базой данных"""
         try:
-            self.pool = await asyncpg.create_pool(DATABASE_URL)
+            # ИСПРАВЛЕНИЕ: Настройка параметров пула соединений
+            self.pool = await asyncpg.create_pool(
+                DATABASE_URL,
+                min_size=5,           # Минимальное количество соединений
+                max_size=20,          # Максимальное количество соединений
+                max_queries=50000,    # Максимальное количество запросов на соединение
+                max_inactive_connection_lifetime=300,  # 5 минут
+                command_timeout=60,   # Таймаут команд в секундах
+                server_settings={
+                    'jit': 'off'      # Отключение JIT для стабильности
+                }
+            )
             await self.create_tables()
-            logger.info("Database connection established")
+            logger.info("Database connection established with pool configuration")
         except Exception as e:
             logger.error(f"Failed to connect to database: {e}")
             raise
@@ -51,6 +65,52 @@ class Database:
             )
             decrypted_items.append(item_dict)
         return decrypted_items
+
+    # НОВЫЙ МЕТОД: Безопасное выполнение операций с БД
+    async def safe_execute(self, operation_func, max_retries=3, *args, **kwargs):
+        """
+        Безопасное выполнение операций с базой данных
+        
+        Args:
+            operation_func: Функция для выполнения
+            max_retries: Максимальное количество повторных попыток
+        """
+        async with self._operation_semaphore:
+            for attempt in range(max_retries + 1):
+                try:
+                    return await operation_func(*args, **kwargs)
+                    
+                except asyncpg.InterfaceError as e:
+                    error_msg = str(e).lower()
+                    if "another operation is in progress" in error_msg:
+                        if attempt < max_retries:
+                            # Экспоненциальная задержка: 0.1, 0.2, 0.4 секунды
+                            delay = 0.1 * (2 ** attempt)
+                            logger.warning(f"Database busy, retrying in {delay}s (attempt {attempt + 1}/{max_retries + 1})")
+                            await asyncio.sleep(delay)
+                            continue
+                        else:
+                            logger.error(f"Database operation failed after {max_retries} retries: {e}")
+                            raise
+                    else:
+                        # Другие InterfaceError не ретраим
+                        raise
+                        
+                except asyncpg.PostgresError as e:
+                    # PostgreSQL ошибки (дедлоки, конфликты и т.д.)
+                    if attempt < max_retries and e.sqlstate in ('40001', '40P01', '55P03'):
+                        # Коды ошибок: serialization_failure, deadlock_detected, lock_not_available
+                        delay = 0.05 * (2 ** attempt)
+                        logger.warning(f"Database conflict, retrying in {delay}s: {e.sqlstate}")
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        raise
+                        
+                except Exception as e:
+                    # Все остальные ошибки не ретраим
+                    logger.error(f"Unexpected database error: {e}")
+                    raise
     
     async def create_tables(self):
         """Создание таблиц в базе данных"""
@@ -116,8 +176,9 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_diary_entries_user_date ON diary_entries(user_id, entry_date DESC)"
         ]
         
-        async with self.pool.acquire() as conn:
-            for sql in tables_sql + indexes_sql:
+        # ИСПРАВЛЕНИЕ: Используем отдельные соединения для создания таблиц
+        for sql in tables_sql + indexes_sql:
+            async with self.pool.acquire() as conn:
                 await conn.execute(sql)
         
         logger.info("Database tables created/verified")
@@ -126,69 +187,80 @@ class Database:
     
     async def create_task(self, user_id: int, text: str, category: str = None, deadline=None) -> int:
         """Создание новой задачи с шифрованием"""
-        encrypted_text = self._encrypt_text(text)
+        async def _create_task():
+            encrypted_text = self._encrypt_text(text)
+            async with self.pool.acquire() as conn:
+                task_id = await conn.fetchval(
+                    """INSERT INTO tasks (user_id, text, category, deadline) 
+                       VALUES ($1, $2, $3, $4) RETURNING task_id""",
+                    user_id, encrypted_text, category, deadline
+                )
+                logger.info(f"Created encrypted task {task_id} for user {user_id}")
+                return task_id
         
-        async with self.pool.acquire() as conn:
-            task_id = await conn.fetchval(
-                """INSERT INTO tasks (user_id, text, category, deadline) 
-                   VALUES ($1, $2, $3, $4) RETURNING task_id""",
-                user_id, encrypted_text, category, deadline
-            )
-            logger.info(f"Created encrypted task {task_id} for user {user_id}")
-            return task_id
+        return await self.safe_execute(_create_task)
     
     async def get_user_tasks(self, user_id: int, status: str = None) -> List[Dict[str, Any]]:
         """Получение задач пользователя с расшифровкой"""
-        base_query = """SELECT task_id, text, category, deadline, status, created_at, completed_at, marked_overdue_at
-                       FROM tasks WHERE user_id = $1"""
+        async def _get_tasks():
+            base_query = """SELECT task_id, text, category, deadline, status, created_at, completed_at, marked_overdue_at
+                           FROM tasks WHERE user_id = $1"""
+            
+            async with self.pool.acquire() as conn:
+                if status:
+                    tasks = await conn.fetch(f"{base_query} AND status = $2 ORDER BY created_at DESC", user_id, status)
+                else:
+                    tasks = await conn.fetch(f"{base_query} ORDER BY created_at DESC", user_id)
+            
+            return self._decrypt_items(tasks, 'text', 'task_id', 'task')
         
-        async with self.pool.acquire() as conn:
-            if status:
-                tasks = await conn.fetch(f"{base_query} AND status = $2 ORDER BY created_at DESC", user_id, status)
-            else:
-                tasks = await conn.fetch(f"{base_query} ORDER BY created_at DESC", user_id)
-        
-        return self._decrypt_items(tasks, 'text', 'task_id', 'task')
+        return await self.safe_execute(_get_tasks)
     
     async def update_task_status(self, task_id: int, user_id: int, status: str) -> bool:
         """Обновление статуса задачи"""
-        async with self.pool.acquire() as conn:
-            # Используем явное приведение типов и разделяем логику для избежания конфликта типов
-            if status in ('completed', 'failed'):
-                result = await conn.execute(
-                    """UPDATE tasks 
-                    SET status = $1::varchar, 
-                        completed_at = NOW()
-                    WHERE task_id = $2 AND user_id = $3""",
-                    status, task_id, user_id
-                )
-            elif status == 'overdue':
-                result = await conn.execute(
-                    """UPDATE tasks 
-                    SET status = $1::varchar, 
-                        marked_overdue_at = NOW()
-                    WHERE task_id = $2 AND user_id = $3""",
-                    status, task_id, user_id
-                )
-            else:
-                # Для других статусов (например, 'active')
-                result = await conn.execute(
-                    """UPDATE tasks 
-                    SET status = $1::varchar
-                    WHERE task_id = $2 AND user_id = $3""",
-                    status, task_id, user_id
-                )
-            
-            return result != "UPDATE 0"
+        async def _update_status():
+            async with self.pool.acquire() as conn:
+                # ИСПРАВЛЕНИЕ: Используем транзакцию для атомарности
+                async with conn.transaction():
+                    if status in ('completed', 'failed'):
+                        result = await conn.execute(
+                            """UPDATE tasks 
+                            SET status = $1::varchar, 
+                                completed_at = NOW()
+                            WHERE task_id = $2 AND user_id = $3""",
+                            status, task_id, user_id
+                        )
+                    elif status == 'overdue':
+                        result = await conn.execute(
+                            """UPDATE tasks 
+                            SET status = $1::varchar, 
+                                marked_overdue_at = NOW()
+                            WHERE task_id = $2 AND user_id = $3""",
+                            status, task_id, user_id
+                        )
+                    else:
+                        result = await conn.execute(
+                            """UPDATE tasks 
+                            SET status = $1::varchar
+                            WHERE task_id = $2 AND user_id = $3""",
+                            status, task_id, user_id
+                        )
+                    
+                    return result != "UPDATE 0"
+        
+        return await self.safe_execute(_update_status)
     
     async def delete_task(self, task_id: int, user_id: int) -> bool:
         """Удаление задачи"""
-        async with self.pool.acquire() as conn:
-            result = await conn.execute(
-                "DELETE FROM tasks WHERE task_id = $1 AND user_id = $2",
-                task_id, user_id
-            )
-            return result != "DELETE 0"
+        async def _delete_task():
+            async with self.pool.acquire() as conn:
+                result = await conn.execute(
+                    "DELETE FROM tasks WHERE task_id = $1 AND user_id = $2",
+                    task_id, user_id
+                )
+                return result != "DELETE 0"
+        
+        return await self.safe_execute(_delete_task)
     
     # === МЕТОДЫ ДЛЯ РАБОТЫ С НАПОМИНАНИЯМИ ===
     
@@ -196,166 +268,202 @@ class Database:
                             trigger_time=None, cron_expression: str = None, 
                             is_built_in: bool = False) -> int:
         """Создание нового напоминания с шифрованием"""
-        encrypted_text = self._encrypt_text(text)
+        async def _create_reminder():
+            encrypted_text = self._encrypt_text(text)
+            async with self.pool.acquire() as conn:
+                reminder_id = await conn.fetchval(
+                    """INSERT INTO reminders (user_id, text, reminder_type, trigger_time, cron_expression, is_built_in) 
+                       VALUES ($1, $2, $3, $4, $5, $6) RETURNING reminder_id""",
+                    user_id, encrypted_text, reminder_type, trigger_time, cron_expression, is_built_in
+                )
+                logger.info(f"Created encrypted reminder {reminder_id} for user {user_id}")
+                return reminder_id
         
-        async with self.pool.acquire() as conn:
-            reminder_id = await conn.fetchval(
-                """INSERT INTO reminders (user_id, text, reminder_type, trigger_time, cron_expression, is_built_in) 
-                   VALUES ($1, $2, $3, $4, $5, $6) RETURNING reminder_id""",
-                user_id, encrypted_text, reminder_type, trigger_time, cron_expression, is_built_in
-            )
-            logger.info(f"Created encrypted reminder {reminder_id} for user {user_id}")
-            return reminder_id
+        return await self.safe_execute(_create_reminder)
     
     async def get_user_reminders(self, user_id: int) -> List[Dict[str, Any]]:
         """Получение напоминаний пользователя с расшифровкой"""
-        async with self.pool.acquire() as conn:
-            reminders = await conn.fetch(
-                """SELECT reminder_id, text, reminder_type, trigger_time, cron_expression, 
-                          is_active, is_built_in, created_at 
-                   FROM reminders 
-                   WHERE user_id = $1 
-                   ORDER BY created_at DESC""",
-                user_id
-            )
+        async def _get_reminders():
+            async with self.pool.acquire() as conn:
+                reminders = await conn.fetch(
+                    """SELECT reminder_id, text, reminder_type, trigger_time, cron_expression, 
+                              is_active, is_built_in, created_at 
+                       FROM reminders 
+                       WHERE user_id = $1 
+                       ORDER BY created_at DESC""",
+                    user_id
+                )
+            
+            return self._decrypt_items(reminders, 'text', 'reminder_id', 'reminder')
         
-        return self._decrypt_items(reminders, 'text', 'reminder_id', 'reminder')
+        return await self.safe_execute(_get_reminders)
     
     async def get_active_reminders(self) -> List[Dict[str, Any]]:
         """Получение всех активных напоминаний для планировщика"""
-        async with self.pool.acquire() as conn:
-            reminders = await conn.fetch(
-                """SELECT reminder_id, user_id, text, reminder_type, trigger_time, cron_expression
-                   FROM reminders 
-                   WHERE is_active = TRUE"""
-            )
+        async def _get_active():
+            async with self.pool.acquire() as conn:
+                reminders = await conn.fetch(
+                    """SELECT reminder_id, user_id, text, reminder_type, trigger_time, cron_expression
+                       FROM reminders 
+                       WHERE is_active = TRUE"""
+                )
+            
+            return self._decrypt_items(reminders, 'text', 'reminder_id', 'reminder')
         
-        return self._decrypt_items(reminders, 'text', 'reminder_id', 'reminder')
+        return await self.safe_execute(_get_active)
     
     async def update_reminder_status(self, reminder_id: int, is_active: bool) -> bool:
         """Обновление статуса напоминания"""
-        async with self.pool.acquire() as conn:
-            result = await conn.execute(
-                "UPDATE reminders SET is_active = $1 WHERE reminder_id = $2",
-                is_active, reminder_id
-            )
-            return result != "UPDATE 0"
+        async def _update_reminder():
+            async with self.pool.acquire() as conn:
+                result = await conn.execute(
+                    "UPDATE reminders SET is_active = $1 WHERE reminder_id = $2",
+                    is_active, reminder_id
+                )
+                return result != "UPDATE 0"
+        
+        return await self.safe_execute(_update_reminder)
     
     async def delete_reminder(self, reminder_id: int, user_id: int) -> bool:
         """Удаление напоминания"""
-        async with self.pool.acquire() as conn:
-            result = await conn.execute(
-                "DELETE FROM reminders WHERE reminder_id = $1 AND user_id = $2",
-                reminder_id, user_id
-            )
-            return result != "DELETE 0"
+        async def _delete_reminder():
+            async with self.pool.acquire() as conn:
+                result = await conn.execute(
+                    "DELETE FROM reminders WHERE reminder_id = $1 AND user_id = $2",
+                    reminder_id, user_id
+                )
+                return result != "DELETE 0"
+        
+        return await self.safe_execute(_delete_reminder)
     
     # === МЕТОДЫ ДЛЯ РАБОТЫ С ДНЕВНИКОМ ===
     
     async def create_diary_entry(self, user_id: int, entry_date, content: str) -> int:
         """Создание новой записи дневника с шифрованием"""
-        encrypted_content = self._encrypt_text(content)
+        async def _create_entry():
+            encrypted_content = self._encrypt_text(content)
+            async with self.pool.acquire() as conn:
+                entry_id = await conn.fetchval(
+                    """INSERT INTO diary_entries (user_id, entry_date, content) 
+                       VALUES ($1, $2, $3) RETURNING entry_id""",
+                    user_id, entry_date, encrypted_content
+                )
+                logger.info(f"Created encrypted diary entry {entry_id} for user {user_id}")
+                return entry_id
         
-        async with self.pool.acquire() as conn:
-            entry_id = await conn.fetchval(
-                """INSERT INTO diary_entries (user_id, entry_date, content) 
-                   VALUES ($1, $2, $3) RETURNING entry_id""",
-                user_id, entry_date, encrypted_content
-            )
-            logger.info(f"Created encrypted diary entry {entry_id} for user {user_id}")
-            return entry_id
+        return await self.safe_execute(_create_entry)
     
     async def get_diary_entries_by_date(self, user_id: int, entry_date) -> List[Dict[str, Any]]:
         """Получение записей дневника за определенную дату с расшифровкой"""
-        async with self.pool.acquire() as conn:
-            entries = await conn.fetch(
-                """SELECT entry_id, content, created_at, is_edited 
-                   FROM diary_entries 
-                   WHERE user_id = $1 AND entry_date = $2 
-                   ORDER BY created_at ASC""",
-                user_id, entry_date
-            )
+        async def _get_entries():
+            async with self.pool.acquire() as conn:
+                entries = await conn.fetch(
+                    """SELECT entry_id, content, created_at, is_edited 
+                       FROM diary_entries 
+                       WHERE user_id = $1 AND entry_date = $2 
+                       ORDER BY created_at ASC""",
+                    user_id, entry_date
+                )
+            
+            return self._decrypt_items(entries, 'content', 'entry_id', 'diary entry')
         
-        return self._decrypt_items(entries, 'content', 'entry_id', 'diary entry')
+        return await self.safe_execute(_get_entries)
     
     async def get_diary_entries_by_period(self, user_id: int, start_date, end_date) -> List[Dict[str, Any]]:
         """Получение записей дневника за период с расшифровкой"""
-        async with self.pool.acquire() as conn:
-            entries = await conn.fetch(
-                """SELECT entry_date, content, created_at, is_edited 
-                   FROM diary_entries 
-                   WHERE user_id = $1 AND entry_date BETWEEN $2 AND $3 
-                   ORDER BY entry_date DESC, created_at ASC""",
-                user_id, start_date, end_date
-            )
+        async def _get_period_entries():
+            async with self.pool.acquire() as conn:
+                entries = await conn.fetch(
+                    """SELECT entry_date, content, created_at, is_edited 
+                       FROM diary_entries 
+                       WHERE user_id = $1 AND entry_date BETWEEN $2 AND $3 
+                       ORDER BY entry_date DESC, created_at ASC""",
+                    user_id, start_date, end_date
+                )
+            
+            # Здесь нет entry_id, поэтому используем другой подход
+            decrypted_entries = []
+            for entry in entries:
+                entry_dict = dict(entry)
+                entry_dict['content'] = self._decrypt_text(entry['content'], item_type="diary entry")
+                decrypted_entries.append(entry_dict)
+            
+            return decrypted_entries
         
-        # Здесь нет entry_id, поэтому используем другой подход
-        decrypted_entries = []
-        for entry in entries:
-            entry_dict = dict(entry)
-            entry_dict['content'] = self._decrypt_text(entry['content'], item_type="diary entry")
-            decrypted_entries.append(entry_dict)
-        
-        return decrypted_entries
+        return await self.safe_execute(_get_period_entries)
     
     async def update_diary_entry(self, entry_id: int, user_id: int, content: str) -> bool:
         """Обновление записи дневника с шифрованием"""
-        encrypted_content = self._encrypt_text(content)
+        async def _update_entry():
+            encrypted_content = self._encrypt_text(content)
+            async with self.pool.acquire() as conn:
+                result = await conn.execute(
+                    """UPDATE diary_entries 
+                       SET content = $1, updated_at = NOW(), is_edited = TRUE 
+                       WHERE entry_id = $2 AND user_id = $3""",
+                    encrypted_content, entry_id, user_id
+                )
+                return result != "UPDATE 0"
         
-        async with self.pool.acquire() as conn:
-            result = await conn.execute(
-                """UPDATE diary_entries 
-                   SET content = $1, updated_at = NOW(), is_edited = TRUE 
-                   WHERE entry_id = $2 AND user_id = $3""",
-                encrypted_content, entry_id, user_id
-            )
-            return result != "UPDATE 0"
+        return await self.safe_execute(_update_entry)
     
     async def delete_diary_entry(self, entry_id: int, user_id: int) -> bool:
         """Удаление записи дневника"""
-        async with self.pool.acquire() as conn:
-            result = await conn.execute(
-                "DELETE FROM diary_entries WHERE entry_id = $1 AND user_id = $2",
-                entry_id, user_id
-            )
-            return result != "DELETE 0"
+        async def _delete_entry():
+            async with self.pool.acquire() as conn:
+                result = await conn.execute(
+                    "DELETE FROM diary_entries WHERE entry_id = $1 AND user_id = $2",
+                    entry_id, user_id
+                )
+                return result != "DELETE 0"
+        
+        return await self.safe_execute(_delete_entry)
     
     async def get_diary_entry_date(self, entry_id: int) -> Optional[Any]:
         """Получение даты записи дневника"""
-        async with self.pool.acquire() as conn:
-            return await conn.fetchval(
-                "SELECT entry_date FROM diary_entries WHERE entry_id = $1",
-                entry_id
-            )
+        async def _get_date():
+            async with self.pool.acquire() as conn:
+                return await conn.fetchval(
+                    "SELECT entry_date FROM diary_entries WHERE entry_id = $1",
+                    entry_id
+                )
+        
+        return await self.safe_execute(_get_date)
     
     # === МЕТОДЫ ДЛЯ РАБОТЫ С КАТЕГОРИЯМИ ===
     
     async def get_task_categories(self, user_id: int) -> List[Dict[str, Any]]:
         """Получение категорий задач пользователя"""
-        async with self.pool.acquire() as conn:
-            categories = await conn.fetch(
-                """SELECT category_id, name, created_at 
-                   FROM task_categories 
-                   WHERE user_id = $1 
-                   ORDER BY created_at DESC""",
-                user_id
-            )
+        async def _get_categories():
+            async with self.pool.acquire() as conn:
+                categories = await conn.fetch(
+                    """SELECT category_id, name, created_at 
+                       FROM task_categories 
+                       WHERE user_id = $1 
+                       ORDER BY created_at DESC""",
+                    user_id
+                )
+            
+            return [dict(category) for category in categories]
         
-        return [dict(category) for category in categories]
+        return await self.safe_execute(_get_categories)
     
     async def create_task_category(self, user_id: int, name: str) -> Optional[int]:
         """Создание новой категории задач"""
-        async with self.pool.acquire() as conn:
-            try:
-                category_id = await conn.fetchval(
-                    """INSERT INTO task_categories (user_id, name) 
-                       VALUES ($1, $2) RETURNING category_id""",
-                    user_id, name
-                )
-                return category_id
-            except Exception as e:
-                logger.error(f"Failed to create category: {e}")
-                return None
+        async def _create_category():
+            async with self.pool.acquire() as conn:
+                try:
+                    category_id = await conn.fetchval(
+                        """INSERT INTO task_categories (user_id, name) 
+                           VALUES ($1, $2) RETURNING category_id""",
+                        user_id, name
+                    )
+                    return category_id
+                except Exception as e:
+                    logger.error(f"Failed to create category: {e}")
+                    return None
+        
+        return await self.safe_execute(_create_category)
     
     # === МИГРАЦИЯ СУЩЕСТВУЮЩИХ ДАННЫХ ===
     
@@ -383,20 +491,23 @@ class Database:
     
     async def migrate_existing_data_to_encrypted(self):
         """Миграция существующих незашифрованных данных"""
-        logger.info("Starting data migration to encrypted format...")
-        
-        async with self.pool.acquire() as conn:
-            # Миграция всех таблиц с зашифрованными данными
-            migrations = [
-                ("tasks", "task_id", "text"),
-                ("reminders", "reminder_id", "text"),
-                ("diary_entries", "entry_id", "content")
-            ]
+        async def _migrate():
+            logger.info("Starting data migration to encrypted format...")
             
-            for table, id_field, text_field in migrations:
-                await self._migrate_table_data(conn, table, id_field, text_field)
+            async with self.pool.acquire() as conn:
+                # Миграция всех таблиц с зашифрованными данными
+                migrations = [
+                    ("tasks", "task_id", "text"),
+                    ("reminders", "reminder_id", "text"),
+                    ("diary_entries", "entry_id", "content")
+                ]
+                
+                for table, id_field, text_field in migrations:
+                    await self._migrate_table_data(conn, table, id_field, text_field)
+            
+            logger.info("Data migration to encrypted format completed")
         
-        logger.info("Data migration to encrypted format completed")
+        return await self.safe_execute(_migrate)
 
 # Глобальный экземпляр базы данных
 db = Database()
