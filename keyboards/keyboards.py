@@ -76,6 +76,7 @@ def get_deadline_selection_keyboard():
     """Клавиатура для выбора дедлайна"""
     keyboard = [
         [InlineKeyboardButton(text="📅 До конца дня", callback_data="deadline_today")],
+        [InlineKeyboardButton(text="📅 Завтра", callback_data="deadline_tomorrow")],
         [InlineKeyboardButton(text="📆 До конца недели", callback_data="deadline_week")],
         [InlineKeyboardButton(text="🗓 До конца месяца", callback_data="deadline_month")],
         [InlineKeyboardButton(text="📊 До конца года", callback_data="deadline_year")],

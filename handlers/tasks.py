@@ -68,6 +68,12 @@ def calculate_deadline(action, user_timezone, current_time):
             user_timezone, 
             current_time.year, current_time.month, current_time.day
         )
+    elif action == "tomorrow":
+        tomorrow = current_time + timedelta(days=1)
+        return create_deadline_from_user_time(
+            user_timezone,
+            tomorrow.year, tomorrow.month, tomorrow.day
+        )
     elif action == "week":
         days_until_sunday = 6 - current_time.weekday()
         target_date = current_time + timedelta(days=days_until_sunday)
