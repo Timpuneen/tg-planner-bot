@@ -244,7 +244,7 @@ async def process_period_start(message: types.Message, state: FSMContext):
         
         await message.answer(
             f"✅ Начальная дата: {start_date.strftime('%d.%m.%Y')}\n\n"
-            "Введите конечную дату периода в формате ДД.ММ.ГГГГ:"
+            "Введите конечную дату периода в формате ДД.ММ.ГГГГ или 'now' для текущей даты:"
         )
         await state.set_state(DiaryStates.waiting_for_period_end)
     except ValueError:
@@ -256,7 +256,13 @@ async def process_period_start(message: types.Message, state: FSMContext):
 async def process_period_end(message: types.Message, state: FSMContext):
     """Обработка конечной даты периода"""
     try:
-        end_date = _parse_date_input(message.text)
+        # Проверяем, если пользователь ввел "now"
+        if message.text.strip().lower() == "now":
+            user_timezone = await _get_user_timezone(message.from_user.id)
+            end_date = get_user_time(user_timezone).date()
+        else:
+            end_date = _parse_date_input(message.text)
+        
         data = await state.get_data()
         start_date = data.get("start_date")
         
@@ -270,7 +276,7 @@ async def process_period_end(message: types.Message, state: FSMContext):
         await state.clear()
     except ValueError:
         await message.answer(
-            "❌ Неверный формат даты. Введите дату в формате ДД.ММ.ГГГГ (например, 25.02.2025):"
+            "❌ Неверный формат даты. Введите дату в формате ДД.ММ.ГГГГ (например, 25.02.2025) или 'now' для текущей даты:"
         )
 
 # Новые обработчики для выбора месяца
