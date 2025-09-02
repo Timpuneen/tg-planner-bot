@@ -3,6 +3,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from datetime import datetime, timedelta
 import logging
+import calendar
 
 from database.connection import db
 from keyboards.keyboards import get_diary_menu_keyboard, get_back_to_main_keyboard
@@ -18,6 +19,7 @@ class DiaryStates(StatesGroup):
     waiting_for_period_start = State()
     waiting_for_period_end = State()
     waiting_for_edit = State()
+    waiting_for_month = State()  # Новое состояние для выбора месяца
 
 async def _get_user_timezone(user_id: int) -> str:
     """Вспомогательная функция для получения часового пояса пользователя"""
@@ -28,6 +30,17 @@ async def _get_user_timezone(user_id: int) -> str:
 def _parse_date_input(date_input: str) -> datetime:
     """Парсинг даты из строки с валидацией"""
     return datetime.strptime(date_input.strip(), "%d.%m.%Y").date()
+
+def _parse_month_input(month_input: str) -> tuple:
+    """Парсинг месяца из строки в формате мм.гггг"""
+    month_str, year_str = month_input.strip().split('.')
+    month = int(month_str)
+    year = int(year_str)
+    
+    if month < 1 or month > 12:
+        raise ValueError("Месяц должен быть от 1 до 12")
+    
+    return month, year
 
 def _create_date_keyboard(current_date):
     """Создание клавиатуры выбора даты"""
@@ -54,7 +67,8 @@ def _create_view_menu_keyboard(current_date):
         [types.InlineKeyboardButton(text="Сегодня", callback_data=f"view_diary_{current_date.isoformat()}")],
         [types.InlineKeyboardButton(text="Вчера", callback_data=f"view_diary_{(current_date - timedelta(days=1)).isoformat()}")],
         [types.InlineKeyboardButton(text="📅 Своя дата", callback_data="view_diary_custom")],
-        [types.InlineKeyboardButton(text="📊 Выбрать период", callback_data="view_diary_period")]
+        [types.InlineKeyboardButton(text="📊 Выбрать период", callback_data="view_diary_period")],
+        [types.InlineKeyboardButton(text="🗓️ Выбрать месяц", callback_data="view_diary_month")]  # Новая кнопка
     ])
 
 def _decrypt_entry_safely(entry_content: str, entry_id: int) -> str:
@@ -258,6 +272,114 @@ async def process_period_end(message: types.Message, state: FSMContext):
         await message.answer(
             "❌ Неверный формат даты. Введите дату в формате ДД.ММ.ГГГГ (например, 25.02.2025):"
         )
+
+# Новые обработчики для выбора месяца
+@router.callback_query(lambda c: c.data == "view_diary_month")
+async def ask_view_month(callback: types.CallbackQuery, state: FSMContext):
+    """Запрос месяца для просмотра"""
+    await callback.message.edit_text(
+        "🗓️ Введите месяц для просмотра в формате ММ.ГГГГ (например, 02.2025):"
+    )
+    await state.set_state(DiaryStates.waiting_for_month)
+
+@router.message(DiaryStates.waiting_for_month)
+async def process_view_month(message: types.Message, state: FSMContext):
+    """Обработка месяца для просмотра"""
+    try:
+        month, year = _parse_month_input(message.text)
+        
+        # Получаем первый и последний день месяца
+        first_day = datetime(year, month, 1).date()
+        last_day = datetime(year, month, calendar.monthrange(year, month)[1]).date()
+        
+        await show_entries_for_month(message, month, year, first_day, last_day, user_id=message.from_user.id)
+        await state.clear()
+    except ValueError as e:
+        if "invalid literal" in str(e) or "not enough values" in str(e):
+            await message.answer(
+                "❌ Неверный формат месяца. Введите месяц в формате ММ.ГГГГ (например, 02.2025):"
+            )
+        else:
+            await message.answer(
+                "❌ Неверный месяц. Введите месяц от 01 до 12 в формате ММ.ГГГГ (например, 02.2025):"
+            )
+
+async def show_entries_for_month(message: types.Message, month: int, year: int, start_date, end_date, user_id=None):
+    """Показать записи за месяц"""
+    if user_id is None:
+        user_id = message.from_user.id if hasattr(message, 'from_user') else message.chat.id
+    
+    try:
+        entries = await db.get_diary_entries_by_period(user_id, start_date, end_date)
+        logger.info(f"Retrieved {len(entries)} diary entries for user {user_id} for month {month:02d}.{year}")
+    except Exception as e:
+        logger.error(f"Failed to retrieve diary entries for month: {e}")
+        await message.answer("❌ Произошла ошибка при получении записей")
+        return
+    
+    # Получаем название месяца на русском
+    month_names = {
+        1: "январь", 2: "февраль", 3: "март", 4: "апрель",
+        5: "май", 6: "июнь", 7: "июль", 8: "август",
+        9: "сентябрь", 10: "октябрь", 11: "ноябрь", 12: "декабрь"
+    }
+    month_name = month_names.get(month, "неизвестный месяц")
+    
+    if not entries:
+        await message.answer(
+            f"📖 За {month_name} {year} года записей нет"
+        )
+        return
+    
+    # Получаем часовой пояс пользователя для конвертации времени
+    user_timezone = await _get_user_timezone(user_id)
+    
+    # Формируем текст с записями по датам
+    text = f"📖 Записи за {month_name} {year} года:\n\n"
+    
+    current_date = None
+    for entry in entries:
+        if current_date != entry['entry_date']:
+            current_date = entry['entry_date']
+            text += f"\n📅 {current_date.strftime('%d.%m.%Y')}\n"
+        
+        edited_mark = " (edited)" if entry['is_edited'] else ""
+        
+        # Конвертируем время создания из UTC в часовой пояс пользователя
+        user_created_time = convert_scheduler_time_to_user_timezone(
+            entry['created_at'], user_timezone, get_scheduler_timezone()
+        )
+        time_str = user_created_time.strftime('%H:%M')
+        created_date = user_created_time.date()
+        entry_date = entry['entry_date']
+        
+        # Информация о времени создания
+        if created_date != entry_date:
+            time_info = f"{time_str} (создано {created_date.strftime('%d.%m.%Y')})"
+        else:
+            time_info = time_str
+        
+        text += f"• {entry['content']} - {time_info}{edited_mark}\n"
+    
+    # Разбиваем длинный текст на части
+    if len(text) > 4000:
+        parts = []
+        current_part = ""
+        
+        for line in text.split('\n'):
+            if len(current_part + line + '\n') > 4000:
+                parts.append(current_part)
+                current_part = line + '\n'
+            else:
+                current_part += line + '\n'
+        
+        if current_part:
+            parts.append(current_part)
+        
+        for part in parts:
+            await message.answer(part)
+    else:
+        await message.answer(text)
 
 @router.callback_query(lambda c: c.data.startswith("view_diary_2"))
 async def show_diary_entries(callback: types.CallbackQuery):
