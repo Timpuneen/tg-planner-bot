@@ -162,21 +162,6 @@ async def cleanup_unused_categories(user_id: int):
     except Exception as e:
         logger.error(f"Error cleaning up unused categories for user {user_id}: {e}")
 
-async def cleanup_unused_categories_all_users():
-    """Очистка неиспользуемых категорий для всех пользователей (для планировщика)"""
-    try:
-        async with db.pool.acquire() as conn:
-            # Получаем всех пользователей, у которых есть категории
-            users = await conn.fetch(
-                "SELECT DISTINCT user_id FROM task_categories"
-            )
-            
-        for user in users:
-            await cleanup_unused_categories(user['user_id'])
-            
-    except Exception as e:
-        logger.error(f"Error in global category cleanup: {e}")
-
 # ======= СОЗДАНИЕ ЗАДАЧ =======
 
 @router.message(lambda message: message.text == "➕ Создать новую задачу")
@@ -929,68 +914,6 @@ async def complete_extend_task(callback, state: FSMContext, new_deadline):
     await state.clear()
 
 # ======= СИСТЕМНЫЕ ФУНКЦИИ =======
-
-async def process_overdue_tasks_for_users(users):
-    """Обработка просроченных задач для списка пользователей"""
-    for user in users:
-        user_tz = pytz.timezone(user['timezone'])
-        current_time = datetime.now(user_tz)
-        current_utc = normalize_datetime_for_db(current_time)
-        
-        async with db.pool.acquire() as conn:
-            # Проверяем активные задачи с дедлайном
-            overdue_tasks = await conn.fetch(
-                """SELECT task_id FROM tasks 
-                   WHERE user_id = $1 AND status = 'active' 
-                   AND deadline IS NOT NULL AND deadline < $2""",
-                user['user_id'], current_utc
-            )
-            
-            if overdue_tasks:
-                # Проверяем лимит просроченных задач
-                overdue_count = await conn.fetchval(
-                    "SELECT COUNT(*) FROM tasks WHERE user_id = $1 AND status = 'overdue'",
-                    user['user_id']
-                )
-                
-                tasks_to_mark = len(overdue_tasks)
-                
-                # Если превышаем лимит, удаляем самые старые просроченные
-                if overdue_count + tasks_to_mark > TASK_LIMITS['overdue']:
-                    delete_count = (overdue_count + tasks_to_mark) - TASK_LIMITS['overdue']
-                    await conn.execute(
-                        """DELETE FROM tasks WHERE task_id IN (
-                            SELECT task_id FROM tasks 
-                            WHERE user_id = $1 AND status = 'overdue'
-                            ORDER BY marked_overdue_at ASC LIMIT $2
-                        )""",
-                        user['user_id'], delete_count
-                    )
-                
-                # Помечаем задачи как просроченные
-                task_ids = [task['task_id'] for task in overdue_tasks]
-                await conn.execute(
-                    """UPDATE tasks SET status = 'overdue', marked_overdue_at = NOW() 
-                       WHERE task_id = ANY($1::int[])""",
-                    task_ids
-                )
-                
-                logger.info(f"Marked {len(task_ids)} tasks as overdue for user {user['user_id']}")
-
-async def check_overdue_tasks():
-    """Проверка и пометка просроченных задач (вызывается планировщиком в 00:00)"""
-    try:
-        async with db.pool.acquire() as conn:
-            # Получаем всех пользователей с их часовыми поясами
-            users = await conn.fetch("SELECT user_id, timezone FROM users")
-            
-        await process_overdue_tasks_for_users(users)
-        
-        # После обработки просроченных задач, очищаем неиспользуемые категории для всех пользователей
-        await cleanup_unused_categories_all_users()
-        
-    except Exception as e:
-        logger.error(f"Error checking overdue tasks: {e}")
 
 async def enforce_task_limits(user_id: int, status: str):
     """Принудительное соблюдение лимитов задач"""

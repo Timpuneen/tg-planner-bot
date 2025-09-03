@@ -450,9 +450,6 @@ class SchedulerService:
         }
         
         try:
-            # ИСПРАВЛЕНИЕ: Используем отдельные соединения для каждой операции
-            # и добавляем блокировки на уровне записей
-            
             # Получаем данные пользователя
             async with db.pool.acquire() as conn:
                 user = await conn.fetchrow("SELECT timezone FROM users WHERE user_id = $1", user_id)
@@ -477,31 +474,28 @@ class SchedulerService:
                         user_id, current_utc
                     )
                     
-                    if not overdue_tasks:
-                        return  # Нет просроченных задач
-                    
-                    # Считаем текущее количество просроченных задач
-                    overdue_count = await conn.fetchval(
-                        "SELECT COUNT(*) FROM tasks WHERE user_id = $1 AND status = 'overdue'",
-                        user_id
-                    )
-                    
-                    tasks_to_mark = len(overdue_tasks)
-                    
-                    # Если превышаем лимит, удаляем самые старые просроченные
-                    if overdue_count + tasks_to_mark > TASK_LIMITS['overdue']:
-                        delete_count = (overdue_count + tasks_to_mark) - TASK_LIMITS['overdue']
-                        await conn.execute(
-                            """DELETE FROM tasks WHERE task_id IN (
-                                SELECT task_id FROM tasks 
-                                WHERE user_id = $1 AND status = 'overdue'
-                                ORDER BY marked_overdue_at ASC LIMIT $2
-                            )""",
-                            user_id, delete_count
-                        )
-                    
-                    # Помечаем задачи как просроченные
                     if overdue_tasks:
+                        # Считаем текущее количество просроченных задач
+                        overdue_count = await conn.fetchval(
+                            "SELECT COUNT(*) FROM tasks WHERE user_id = $1 AND status = 'overdue'",
+                            user_id
+                        )
+                        
+                        tasks_to_mark = len(overdue_tasks)
+                        
+                        # Если превышаем лимит, удаляем самые старые просроченные
+                        if overdue_count + tasks_to_mark > TASK_LIMITS['overdue']:
+                            delete_count = (overdue_count + tasks_to_mark) - TASK_LIMITS['overdue']
+                            await conn.execute(
+                                """DELETE FROM tasks WHERE task_id IN (
+                                    SELECT task_id FROM tasks 
+                                    WHERE user_id = $1 AND status = 'overdue'
+                                    ORDER BY marked_overdue_at ASC LIMIT $2
+                                )""",
+                                user_id, delete_count
+                            )
+                        
+                        # Помечаем задачи как просроченные
                         task_ids = [task['task_id'] for task in overdue_tasks]
                         await conn.execute(
                             """UPDATE tasks SET status = 'overdue', marked_overdue_at = NOW() 
@@ -510,6 +504,9 @@ class SchedulerService:
                         )
                         
                         logger.info(f"Marked {len(task_ids)} tasks as overdue for user {user_id}")
+                    
+                    # ДОБАВЛЯЕМ: Очистка неиспользуемых категорий после изменения статусов задач
+                    await self._cleanup_unused_categories_for_user(user_id, conn)
         
         except asyncpg.InterfaceError as e:
             if "another operation is in progress" in str(e).lower():
@@ -519,6 +516,69 @@ class SchedulerService:
                 logger.error(f"Interface error checking overdue tasks for user {user_id}: {e}")
         except Exception as e:
             logger.error(f"Error checking overdue tasks for user {user_id}: {e}")
+
+    async def _cleanup_unused_categories_for_user(self, user_id: int, conn=None):
+        """Удаляет неиспользуемые категории задач для пользователя"""
+        try:
+            logger.debug(f"Checking unused categories for user {user_id}")
+            
+            # Используем переданное соединение или создаем новое
+            if conn is None:
+                async with db.pool.acquire() as conn:
+                    await self._perform_category_cleanup(user_id, conn)
+            else:
+                await self._perform_category_cleanup(user_id, conn)
+                
+        except Exception as e:
+            logger.error(f"Error cleaning up unused categories for user {user_id}: {e}")
+
+    async def _perform_category_cleanup(self, user_id: int, conn):
+        """Выполняет очистку категорий для пользователя"""
+        # Находим категории, которые не используются ни в одной задаче
+        unused_categories = await conn.fetch(
+            """SELECT tc.category_id, tc.name 
+            FROM task_categories tc
+            LEFT JOIN tasks t ON tc.name = t.category AND tc.user_id = t.user_id
+            WHERE tc.user_id = $1 AND t.task_id IS NULL""",
+            user_id
+        )
+        
+        logger.debug(f"Found {len(unused_categories)} unused categories for user {user_id}")
+        
+        if unused_categories:
+            # Удаляем неиспользуемые категории
+            category_ids = [cat['category_id'] for cat in unused_categories]
+            await conn.execute(
+                "DELETE FROM task_categories WHERE category_id = ANY($1::int[])",
+                category_ids
+            )
+            
+            category_names = [cat['name'] for cat in unused_categories]
+            logger.info(f"Cleaned up {len(category_ids)} unused categories for user {user_id}: {category_names}")
+        else:
+            logger.debug(f"No unused categories found for user {user_id}")
+
+    # Также добавим глобальную функцию очистки всех категорий, которую можно вызывать отдельно
+    async def cleanup_all_unused_categories(self):
+        """Очистка неиспользуемых категорий для всех пользователей"""
+        try:
+            logger.info("Starting global category cleanup...")
+            
+            async with db.pool.acquire() as conn:
+                # Получаем всех пользователей, у которых есть категории
+                users = await conn.fetch(
+                    "SELECT DISTINCT user_id FROM task_categories"
+                )
+                
+            logger.info(f"Found {len(users)} users with categories to check")
+            
+            for user in users:
+                await self._cleanup_unused_categories_for_user(user['user_id'])
+                
+            logger.info("Global category cleanup completed")
+                
+        except Exception as e:
+            logger.error(f"Error in global category cleanup: {e}")
 
     def _decrypt_content_safely(self, content: str, content_type: str, user_id: int) -> str:
         """Безопасная расшифровка контента с обработкой ошибок"""
