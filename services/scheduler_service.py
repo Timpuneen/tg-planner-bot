@@ -432,7 +432,7 @@ class SchedulerService:
             else:
                 review_text += "📋 Релевантных задач за день нет\n\n"
 
-            review_text += "Хорошего отдыха! 😴\n\n\n\n я календарь0_0\n https://www.youtube.com/watch?v=uJyCxDfHhF4"
+            review_text += "Хорошего отдыха!"
 
             # Отправляем сообщение
             await self.bot.send_message(user_id, review_text)

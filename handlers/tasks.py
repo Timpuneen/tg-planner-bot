@@ -135,6 +135,48 @@ async def send_message_with_fallback(message_or_callback, text, reply_markup=Non
         target = message_or_callback.message if is_callback else message_or_callback
         await target.answer(text, reply_markup=reply_markup)
 
+async def cleanup_unused_categories(user_id: int):
+    """Удаляет неиспользуемые категории задач для пользователя"""
+    try:
+        async with db.pool.acquire() as conn:
+            # Находим категории, которые не используются ни в одной задаче
+            unused_categories = await conn.fetch(
+                """SELECT tc.category_id, tc.name 
+                   FROM task_categories tc
+                   LEFT JOIN tasks t ON tc.name = t.category AND tc.user_id = t.user_id
+                   WHERE tc.user_id = $1 AND t.task_id IS NULL""",
+                user_id
+            )
+            
+            if unused_categories:
+                # Удаляем неиспользуемые категории
+                category_ids = [cat['category_id'] for cat in unused_categories]
+                await conn.execute(
+                    "DELETE FROM task_categories WHERE category_id = ANY($1::int[])",
+                    category_ids
+                )
+                
+                category_names = [cat['name'] for cat in unused_categories]
+                logger.info(f"Cleaned up {len(category_ids)} unused categories for user {user_id}: {category_names}")
+                
+    except Exception as e:
+        logger.error(f"Error cleaning up unused categories for user {user_id}: {e}")
+
+async def cleanup_unused_categories_all_users():
+    """Очистка неиспользуемых категорий для всех пользователей (для планировщика)"""
+    try:
+        async with db.pool.acquire() as conn:
+            # Получаем всех пользователей, у которых есть категории
+            users = await conn.fetch(
+                "SELECT DISTINCT user_id FROM task_categories"
+            )
+            
+        for user in users:
+            await cleanup_unused_categories(user['user_id'])
+            
+    except Exception as e:
+        logger.error(f"Error in global category cleanup: {e}")
+
 # ======= СОЗДАНИЕ ЗАДАЧ =======
 
 @router.message(lambda message: message.text == "➕ Создать новую задачу")
@@ -190,7 +232,7 @@ async def process_task_text(message: types.Message, state: FSMContext):
     data = await state.get_data()
     logger.debug(f"State data after saving text: task_text length = {len(data.get('task_text', ''))}")
     
-    # Получаем последние 10 уникальных категорий пользователя
+    # Получаем последние 10 уникальных категорий пользователя, которые действительно используются
     user_id = message.from_user.id
     async with db.pool.acquire() as conn:
         categories = await conn.fetch(
@@ -453,12 +495,12 @@ async def save_task(callback_or_message, state, deadline, is_from_message=False)
         
         logger.info(f"Task saved successfully with ID: {task_id}")
         
-        # Сохраняем категорию если она новая
+        # Сохраняем категорию если она новая (только добавляем в task_categories, если она не существует)
         if category:
             async with db.pool.acquire() as conn:
                 await conn.execute(
                     """INSERT INTO task_categories (user_id, name) 
-                       VALUES ($1, $2) ON CONFLICT DO NOTHING""",
+                       VALUES ($1, $2) ON CONFLICT (user_id, name) DO NOTHING""",
                     user_id, category
                 )
         
@@ -713,6 +755,9 @@ async def view_tasks_menu(message: types.Message, state: FSMContext):
     # Сначала обновляем просроченные задачи
     await update_overdue_tasks_for_user(message.from_user.id)
     
+    # Очищаем неиспользуемые категории
+    await cleanup_unused_categories(message.from_user.id)
+    
     await message.answer(
         "👀 Просмотр задач\n\n"
         "Выберите категорию:",
@@ -764,6 +809,9 @@ async def handle_group_action(callback: types.CallbackQuery, action: str):
             message = "❌ Задача отмечена как невыполненная"
     elif action == "delete":
         success = await db.delete_task(task_id, user_id)
+        # После удаления задачи очищаем неиспользуемые категории
+        if success:
+            await cleanup_unused_categories(user_id)
         message = "🗑 Задача удалена" if success else "❌ Ошибка при удалении задачи"
     
     if not success and action != "delete":
@@ -938,6 +986,9 @@ async def check_overdue_tasks():
             
         await process_overdue_tasks_for_users(users)
         
+        # После обработки просроченных задач, очищаем неиспользуемые категории для всех пользователей
+        await cleanup_unused_categories_all_users()
+        
     except Exception as e:
         logger.error(f"Error checking overdue tasks: {e}")
 
@@ -973,6 +1024,9 @@ async def enforce_task_limits(user_id: int, status: str):
                 )
                 
                 logger.info(f"Enforced limit for user {user_id}, status {status}, deleted {excess} tasks")
+                
+                # После принудительной очистки задач, очищаем неиспользуемые категории
+                await cleanup_unused_categories(user_id)
     
     except Exception as e:
         logger.error(f"Error enforcing task limits: {e}")
