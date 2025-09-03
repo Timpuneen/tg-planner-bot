@@ -665,22 +665,41 @@ def format_tasks_message(tasks_data, title, user_timezone=None):
         deadline_text = ""
         task_prefix = ""
         
-        if task.get('deadline'):
-            # Конвертируем deadline в пользовательский часовой пояс
-            if user_timezone:
-                deadline_display = pytz.UTC.localize(task['deadline']).astimezone(pytz.timezone(user_timezone))
-                deadline_date = deadline_display.date()
-                
-                # Выделяем задачи на сегодня ТОЛЬКО если они активные
-                if (current_date and deadline_date == current_date and 
-                    task.get('status') == 'active'):
-                    task_prefix = "🚨 "
-                
-                deadline_text = f" (📅 {deadline_display.strftime('%d.%m.%Y')})"
-            else:
-                deadline_text = f" (📅 {task['deadline'].strftime('%d.%m.%Y')})"
-        elif task.get('completed_at'):
-            deadline_text = f" (📅 {task['completed_at'].strftime('%d.%m.%Y')})"
+        task_status = task.get('status')
+        
+        if task_status == 'active':
+            # Для активных задач показываем дедлайн (если есть)
+            if task.get('deadline'):
+                # Конвертируем deadline в пользовательский часовой пояс
+                if user_timezone:
+                    deadline_display = pytz.UTC.localize(task['deadline']).astimezone(pytz.timezone(user_timezone))
+                    deadline_date = deadline_display.date()
+                    
+                    # Выделяем задачи на сегодня
+                    if current_date and deadline_date == current_date:
+                        task_prefix = "🚨 "
+                    
+                    deadline_text = f" (📅 {deadline_display.strftime('%d.%m.%Y')})"
+                else:
+                    deadline_text = f" (📅 {task['deadline'].strftime('%d.%m.%Y')})"
+        
+        elif task_status in ['completed', 'failed']:
+            # Для выполненных и невыполненных задач показываем дату завершения
+            if task.get('completed_at'):
+                if user_timezone:
+                    completed_display = pytz.UTC.localize(task['completed_at']).astimezone(pytz.timezone(user_timezone))
+                    deadline_text = f" (📅 {completed_display.strftime('%d.%m.%Y')})"
+                else:
+                    deadline_text = f" (📅 {task['completed_at'].strftime('%d.%m.%Y')})"
+        
+        elif task_status == 'overdue':
+            # Для просроченных задач показываем дедлайн (который был пропущен)
+            if task.get('deadline'):
+                if user_timezone:
+                    deadline_display = pytz.UTC.localize(task['deadline']).astimezone(pytz.timezone(user_timezone))
+                    deadline_text = f" (📅 {deadline_display.strftime('%d.%m.%Y')})"
+                else:
+                    deadline_text = f" (📅 {task['deadline'].strftime('%d.%m.%Y')})"
         
         return f"{counter}. {task_prefix}{task['text']}{deadline_text}"
     
