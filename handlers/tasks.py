@@ -537,43 +537,101 @@ def create_tasks_keyboard(tasks_data, status):
     
     keyboard = []
     
-    for i, task in enumerate(tasks_data, 1):
+    # ВАЖНО: Используем ту же логику группировки, что и в format_tasks_message
+    categorized_tasks = {}
+    uncategorized_tasks = []
+    
+    for task in tasks_data:
+        if task['category']:
+            if task['category'] not in categorized_tasks:
+                categorized_tasks[task['category']] = []
+            categorized_tasks[task['category']].append(task)
+        else:
+            uncategorized_tasks.append(task)
+    
+    task_counter = 1
+    
+    # Обрабатываем задачи в том же порядке, что и в format_tasks_message
+    # Сначала категоризированные задачи
+    for category_name in sorted(categorized_tasks.keys()):  # Сортируем для стабильности
+        category_tasks = categorized_tasks[category_name]
+        for task in category_tasks:
+            row = []
+            task_id = task['task_id']
+            
+            # Кнопка удаления с правильным номером
+            row.append(InlineKeyboardButton(
+                text=f"🗑#{task_counter}",
+                callback_data=f"group_delete_{task_id}_{status}"
+            ))
+            
+            # Дополнительные кнопки в зависимости от статуса
+            if status == 'active':
+                row.append(InlineKeyboardButton(
+                    text=f"✅#{task_counter}",
+                    callback_data=f"group_complete_{task_id}_{status}"
+                ))
+                row.append(InlineKeyboardButton(
+                    text=f"❌#{task_counter}",
+                    callback_data=f"group_fail_{task_id}_{status}"
+                ))
+            elif status == 'overdue':
+                row.append(InlineKeyboardButton(
+                    text=f"⏰#{task_counter}",
+                    callback_data=f"group_extend_{task_id}_{status}"
+                ))
+                row.append(InlineKeyboardButton(
+                    text=f"✅#{task_counter}",
+                    callback_data=f"group_complete_{task_id}_{status}"
+                ))
+                row.append(InlineKeyboardButton(
+                    text=f"❌#{task_counter}",
+                    callback_data=f"group_fail_{task_id}_{status}"
+                ))
+            
+            keyboard.append(row)
+            task_counter += 1
+    
+    # Потом задачи без категории
+    for task in uncategorized_tasks:
         row = []
         task_id = task['task_id']
         
-        # Кнопка удаления (всегда есть) с номером задачи
+        # Кнопка удаления с правильным номером
         row.append(InlineKeyboardButton(
-            text=f"🗑#{i}",
+            text=f"🗑#{task_counter}",
             callback_data=f"group_delete_{task_id}_{status}"
         ))
         
         # Дополнительные кнопки в зависимости от статуса
         if status == 'active':
             row.append(InlineKeyboardButton(
-                text=f"✅#{i}",
+                text=f"✅#{task_counter}",
                 callback_data=f"group_complete_{task_id}_{status}"
             ))
             row.append(InlineKeyboardButton(
-                text=f"❌#{i}",
+                text=f"❌#{task_counter}",
                 callback_data=f"group_fail_{task_id}_{status}"
             ))
         elif status == 'overdue':
             row.append(InlineKeyboardButton(
-                text=f"⏰#{i}",
+                text=f"⏰#{task_counter}",
                 callback_data=f"group_extend_{task_id}_{status}"
             ))
             row.append(InlineKeyboardButton(
-                text=f"✅#{i}",
+                text=f"✅#{task_counter}",
                 callback_data=f"group_complete_{task_id}_{status}"
             ))
             row.append(InlineKeyboardButton(
-                text=f"❌#{i}",
+                text=f"❌#{task_counter}",
                 callback_data=f"group_fail_{task_id}_{status}"
             ))
         
         keyboard.append(row)
+        task_counter += 1
     
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
 
 def format_tasks_message(tasks_data, title, user_timezone=None):
     """Форматирует сообщение со списком задач"""
@@ -626,8 +684,10 @@ def format_tasks_message(tasks_data, title, user_timezone=None):
         
         return f"{counter}. {task_prefix}{task['text']}{deadline_text}"
     
-    # Задачи по категориям
-    for category_name, category_tasks in categorized_tasks.items():
+    # ВАЖНО: Обрабатываем в том же порядке, что и в create_tasks_keyboard
+    # Задачи по категориям (с сортировкой для стабильности)
+    for category_name in sorted(categorized_tasks.keys()):
+        category_tasks = categorized_tasks[category_name]
         message_parts.append(f"📂 {category_name}")
         
         for task in category_tasks:
